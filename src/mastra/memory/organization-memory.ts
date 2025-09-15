@@ -1,27 +1,31 @@
 import { Memory } from "@mastra/memory";
 import { PostgresStore, PgVector } from "@mastra/pg";
 import { fastembed } from "@mastra/fastembed";
+import { logger } from "../utils/logger";
+import { AgentFlowError, validateOrganizationId } from "../utils/helpers";
+import { getConnectionManager } from "../database/connection-manager";
 
 // Helper function to check if pgvector extension is available
-async function isPgVectorAvailable(connectionString: string, organizationId: string): Promise<boolean> {
+async function isPgVectorAvailable(organizationId: string): Promise<boolean> {
   try {
-    const { Pool } = await import('pg');
-    const pool = new Pool({ connectionString });
+    const connectionManager = getConnectionManager();
     
     // Try to create a test table with vector column
-    await pool.query(`CREATE SCHEMA IF NOT EXISTS "${organizationId}"`);
-    await pool.query(`
+    await connectionManager.createSchemaIfNotExists(organizationId);
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}"._test_vector (
         id SERIAL PRIMARY KEY,
         test_vector VECTOR(10)
       )
     `);
-    await pool.query(`DROP TABLE IF EXISTS "${organizationId}"._test_vector`);
-    await pool.end();
+    await connectionManager.query(`DROP TABLE IF EXISTS "${organizationId}"._test_vector`);
     
     return true;
   } catch (error) {
-    console.warn(`pgvector extension not available: ${error.message}`);
+    logger.warn('pgvector extension not available', { 
+      organizationId, 
+      error: error instanceof Error ? error.message : 'Unknown error' 
+    });
     return false;
   }
 }
@@ -51,7 +55,7 @@ export function createMemoryConfig(
   options: MemoryConfig['options'] = {}
 ): MemoryConfig {
   return {
-    organizationId,
+    organizationId: validateOrganizationId(organizationId),
     agentId,
     agentName,
     options: {
@@ -75,6 +79,9 @@ export async function createOrganizationMemory(config: MemoryConfig): Promise<Me
   // Create connection string with schema name as organization ID
   const connectionString = process.env.DATABASE_URL!;
   
+  // Check if pgvector is available
+  const pgVectorAvailable = await isPgVectorAvailable(organizationId);
+  
   // Create memory instance with PostgreSQL storage
   const memory = new Memory({
     storage: new PostgresStore({
@@ -83,7 +90,7 @@ export async function createOrganizationMemory(config: MemoryConfig): Promise<Me
       schemaName: organizationId
     }),
     // Only add vector support if pgvector is available
-    ...(await isPgVectorAvailable(connectionString, organizationId) ? {
+    ...(pgVectorAvailable ? {
       vector: new PgVector({
         connectionString,
         // Use organization ID as schema name for vector storage
@@ -97,7 +104,7 @@ export async function createOrganizationMemory(config: MemoryConfig): Promise<Me
       },
       lastMessages: options.lastMessages || 10,
       // Only enable semantic recall if pgvector is available and explicitly requested
-      semanticRecall: (await isPgVectorAvailable(connectionString, organizationId)) && options.semanticRecall ? {
+      semanticRecall: pgVectorAvailable && options.semanticRecall ? {
         topK: typeof options.semanticRecall === 'object' 
           ? options.semanticRecall.topK || 3 
           : 3,
@@ -109,6 +116,12 @@ export async function createOrganizationMemory(config: MemoryConfig): Promise<Me
     }
   });
 
+  logger.debug('Organization memory created', { 
+    organizationId, 
+    pgVectorAvailable, 
+    semanticRecall: !!options.semanticRecall 
+  });
+
   return memory;
 }
 
@@ -118,7 +131,7 @@ export class OrganizationMemoryManager {
   private organizationId: string;
 
   constructor(organizationId: string) {
-    this.organizationId = organizationId;
+    this.organizationId = validateOrganizationId(organizationId);
   }
 
   // Get or create memory for a specific agent
@@ -136,24 +149,23 @@ export class OrganizationMemoryManager {
 
   // Initialize all memories for the organization
   async initialize(): Promise<void> {
-    const connectionString = process.env.DATABASE_URL!;
-    
     try {
-      // Ensure the organization schema exists
-      const { Pool } = await import('pg');
-      const pool = new Pool({ connectionString });
+      const connectionManager = getConnectionManager();
       
-      await pool.query(`CREATE SCHEMA IF NOT EXISTS "${this.organizationId}"`);
+      // Ensure the organization schema exists
+      await connectionManager.createSchemaIfNotExists(this.organizationId);
       
       // Initialize pgvector extension in the organization schema
-      await pool.query(`CREATE EXTENSION IF NOT EXISTS vector SCHEMA "${this.organizationId}"`);
+      await connectionManager.createExtensionIfNotExists('vector', this.organizationId);
       
-      await pool.end();
-      
-      console.log(`Memory system initialized for organization: ${this.organizationId}`);
+      logger.info('Memory system initialized', { organizationId: this.organizationId });
     } catch (error) {
-      console.error(`Failed to initialize memory for organization ${this.organizationId}:`, error);
-      throw error;
+      logger.error('Failed to initialize memory', { organizationId: this.organizationId }, error instanceof Error ? error : undefined);
+      throw new AgentFlowError(
+        'Failed to initialize memory system',
+        'MEMORY_INIT_ERROR',
+        { organizationId: this.organizationId }
+      );
     }
   }
 
@@ -162,20 +174,20 @@ export class OrganizationMemoryManager {
     for (const [key, memory] of this.memories) {
       try {
         // Memory cleanup if needed
-        console.log(`Cleaning up memory for ${key}`);
+        logger.debug('Cleaning up memory', { memoryKey: key, organizationId: this.organizationId });
       } catch (error) {
-        console.error(`Error cleaning up memory for ${key}:`, error);
+        logger.error('Error cleaning up memory', { memoryKey: key, organizationId: this.organizationId }, error instanceof Error ? error : undefined);
       }
     }
     this.memories.clear();
   }
 
   // Get memory statistics for the organization
-  async getMemoryStats(): Promise<{
+  getMemoryStats(): {
     organizationId: string;
     activeMemories: number;
     totalAgents: number;
-  }> {
+  } {
     return {
       organizationId: this.organizationId,
       activeMemories: this.memories.size,
@@ -189,10 +201,11 @@ const memoryManagers = new Map<string, OrganizationMemoryManager>();
 
 // Get or create memory manager for an organization
 export function getMemoryManager(organizationId: string): OrganizationMemoryManager {
-  if (!memoryManagers.has(organizationId)) {
-    memoryManagers.set(organizationId, new OrganizationMemoryManager(organizationId));
+  const normalizedOrgId = validateOrganizationId(organizationId);
+  if (!memoryManagers.has(normalizedOrgId)) {
+    memoryManagers.set(normalizedOrgId, new OrganizationMemoryManager(normalizedOrgId));
   }
-  return memoryManagers.get(organizationId)!;
+  return memoryManagers.get(normalizedOrgId)!;
 }
 
 // Initialize memory for an organization

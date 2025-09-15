@@ -2,6 +2,9 @@ import { createTool } from '@mastra/core/tools';
 import { RuntimeContext } from '@mastra/core/runtime-context';
 import { z } from 'zod';
 import { postgresManager } from '../database/postgres-manager';
+import { logger } from '../utils/logger';
+import { AgentFlowError, safeJsonParse, safeJsonStringify, validateOrganizationId } from '../utils/helpers';
+import { cacheManager, cacheKey, invalidateToolCache } from '../utils/cache';
 
 // Import ToolConfig and ToolConfigSchema from types
 import { ToolConfig, ToolConfigSchema } from '../types';
@@ -34,11 +37,10 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
   private tools: Map<string, any> = new Map();
   private configs: Map<string, ToolConfig> = new Map();
   private templates: Map<string, ToolTemplate> = new Map();
-  private cache: Map<string, { data: any; timestamp: number; ttl: number }> = new Map();
   private organizationId: string;
 
   constructor(organizationId: string = 'default') {
-    this.organizationId = organizationId;
+    this.organizationId = validateOrganizationId(organizationId);
     this.initializeDefaultTemplates();
   }
 
@@ -198,50 +200,22 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
 
     // Check if tool already exists in memory
     if (this.configs.has(config.id)) {
-      console.log(`Tool with ID ${config.id} already exists in memory, returning existing tool`);
-      return this.tools.get(config.id);
+      throw new AgentFlowError(
+        `Tool with ID '${config.id}' already exists`,
+        'TOOL_ALREADY_EXISTS',
+        { toolId: config.id, organizationId: this.organizationId }
+      );
     }
 
     try {
       // Check if tool exists in database first
       const existingDbTool = await postgresManager.getTool(this.organizationId, config.id);
       if (existingDbTool) {
-        console.log(`Tool with ID ${config.id} already exists in database, loading into memory`);
-        // Load the existing tool into memory
-        const existingConfig: ToolConfig = {
-          id: existingDbTool.id,
-          name: existingDbTool.name,
-          description: existingDbTool.description,
-          inputSchema: existingDbTool.input_schema,
-          outputSchema: existingDbTool.output_schema,
-          apiEndpoint: existingDbTool.api_endpoint,
-          method: existingDbTool.method,
-          headers: existingDbTool.headers,
-          authentication: existingDbTool.authentication,
-          rateLimit: existingDbTool.rate_limit,
-          timeout: existingDbTool.timeout,
-          retries: existingDbTool.retries,
-          cache: existingDbTool.cache_config,
-          validation: existingDbTool.validation_config,
-          status: existingDbTool.status,
-          metadata: existingDbTool.metadata,
-          createdAt: new Date(existingDbTool.created_at),
-          updatedAt: new Date(existingDbTool.updated_at),
-        };
-
-        const tool = createTool({
-          id: existingConfig.id,
-          description: existingConfig.description,
-          inputSchema: this.buildInputSchema(existingConfig.inputSchema),
-          outputSchema: existingConfig.outputSchema ? this.buildOutputSchema(existingConfig.outputSchema) : undefined,
-          execute: async ({ context, runtimeContext }, options) => {
-            return await this.executeTool(existingConfig, context, runtimeContext, options?.abortSignal);
-          },
-        });
-
-        this.tools.set(existingConfig.id, tool);
-        this.configs.set(existingConfig.id, existingConfig);
-        return tool;
+        throw new AgentFlowError(
+          `Tool with ID '${config.id}' already exists in database`,
+          'TOOL_ALREADY_EXISTS',
+          { toolId: config.id, organizationId: this.organizationId }
+        );
       }
 
       // Persist to database first
@@ -282,8 +256,25 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       this.tools.set(config.id, tool);
       this.configs.set(config.id, config);
 
+      // Invalidate tool cache since we've created a new tool
+      invalidateToolCache(this.organizationId);
+      
+      logger.info('Tool created and cache invalidated', { 
+        toolId: config.id, 
+        organizationId: this.organizationId 
+      });
+
       return tool;
     } catch (error) {
+      // Handle database constraint violations
+      if (error instanceof Error && error.message.includes('duplicate key value violates unique constraint')) {
+        throw new AgentFlowError(
+          `Tool with ID '${config.id}' already exists`,
+          'TOOL_ALREADY_EXISTS',
+          { toolId: config.id, organizationId: this.organizationId }
+        );
+      }
+      
       console.error('Failed to create tool in database:', error);
       throw new Error(`Failed to create tool: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
@@ -357,6 +348,15 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       this.tools.set(toolId, updatedTool);
       this.configs.set(toolId, updatedConfig);
 
+      // Invalidate specific tool cache since we've updated it
+      invalidateToolCache(this.organizationId, toolId);
+      
+      logger.info('Tool updated and cache invalidated', { 
+        toolId, 
+        organizationId: this.organizationId,
+        updatedFields: Object.keys(updates)
+      });
+
       return updatedTool;
     } catch (error) {
       console.error('Failed to update tool in database:', error);
@@ -381,6 +381,15 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
         // Remove from memory
         this.tools.delete(toolId);
         this.configs.delete(toolId);
+        
+        // Invalidate specific tool cache since we've deleted it
+        invalidateToolCache(this.organizationId, toolId);
+        
+        logger.info('Tool deleted and cache invalidated', { 
+          toolId, 
+          organizationId: this.organizationId 
+        });
+        
         return true;
       }
       
@@ -775,24 +784,15 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
   }
 
   private generateCacheKey(config: ToolConfig, context: any): string {
-    return `${config.id}:${JSON.stringify(context)}`;
+    return cacheKey('tool', this.organizationId, config.id, JSON.stringify(context));
   }
 
   private getFromCache(key: string): any | null {
-    const cached = this.cache.get(key);
-    if (cached && Date.now() - cached.timestamp < cached.ttl * 1000) {
-      return cached.data;
-    }
-    this.cache.delete(key);
-    return null;
+    return cacheManager.get(key);
   }
 
   private setCache(key: string, data: any, ttl: number): void {
-    this.cache.set(key, {
-      data,
-      timestamp: Date.now(),
-      ttl,
-    });
+    cacheManager.set(key, data, ttl);
   }
 
   private isValidUrl(url: string): boolean {

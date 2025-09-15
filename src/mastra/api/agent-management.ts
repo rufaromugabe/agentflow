@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { DynamicAgentBuilder, AgentConfig, AgentConfigSchema } from '../agents/dynamic-agent-builder';
 import { DynamicToolBuilder } from '../tools/dynamic-tool-builder';
 import { ToolConfig, ToolConfigSchema } from '../types';
+import { invalidateAgentCache, invalidateToolCache } from '../utils/cache';
 
 // Custom API Controllers for AgentFlow Platform
 // Note: This complements Mastra's default routes, doesn't duplicate them
@@ -25,6 +26,10 @@ export class AgentFlowAPI {
 
       const agent = this.agentBuilder.createAgent(config);
       
+      // Invalidate agent cache since we've created a new agent
+      const organizationId = this.getOrganizationId(c);
+      invalidateAgentCache(organizationId);
+      
       return c.json({
         success: true,
         data: {
@@ -42,6 +47,12 @@ export class AgentFlowAPI {
           error: 'Validation failed',
           details: error.errors,
         }, 400);
+      } else if (error instanceof Error && error.message.includes('AGENT_ALREADY_EXISTS')) {
+        return c.json({
+          success: false,
+          error: 'Agent already exists',
+          details: error.message,
+        }, 409); // Conflict status code
       } else {
         return c.json({
           success: false,
@@ -58,6 +69,10 @@ export class AgentFlowAPI {
       const updates = await c.req.json();
 
       const agent = await this.agentBuilder.updateAgent(agentId, updates);
+      
+      // Invalidate specific agent cache since we've updated it
+      const organizationId = this.getOrganizationId(c);
+      invalidateAgentCache(organizationId, agentId);
       
       return c.json({
         success: true,
@@ -115,6 +130,10 @@ export class AgentFlowAPI {
 
       const agent = await this.agentBuilder.updateAgent(agentId, updatedConfig);
       
+      // Invalidate specific agent cache since we've updated it
+      const organizationId = this.getOrganizationId(c);
+      invalidateAgentCache(organizationId, agentId);
+      
       return c.json({
         success: true,
         data: {
@@ -151,6 +170,10 @@ export class AgentFlowAPI {
         }, 404);
       }
 
+      // Invalidate specific agent cache since we've deleted it
+      const organizationId = this.getOrganizationId(c);
+      invalidateAgentCache(organizationId, agentId);
+
       return c.json({
         success: true,
         message: 'Agent deleted successfully',
@@ -177,6 +200,10 @@ export class AgentFlowAPI {
 
       const tool = await this.toolBuilder.createTool(config);
       
+      // Invalidate tool cache since we've created a new tool
+      const organizationId = this.getOrganizationId(c);
+      invalidateToolCache(organizationId);
+      
       return c.json({
         success: true,
         data: {
@@ -194,6 +221,12 @@ export class AgentFlowAPI {
           error: 'Validation failed',
           details: error.errors,
         }, 400);
+      } else if (error instanceof Error && error.message.includes('TOOL_ALREADY_EXISTS')) {
+        return c.json({
+          success: false,
+          error: 'Tool already exists',
+          details: error.message,
+        }, 409); // Conflict status code
       } else {
         return c.json({
           success: false,
@@ -210,6 +243,10 @@ export class AgentFlowAPI {
       const updates = await c.req.json();
 
       const tool = await this.toolBuilder.updateTool(toolId, updates);
+      
+      // Invalidate specific tool cache since we've updated it
+      const organizationId = this.getOrganizationId(c);
+      invalidateToolCache(organizationId, toolId);
       
       return c.json({
         success: true,
@@ -267,6 +304,10 @@ export class AgentFlowAPI {
 
       const tool = await this.toolBuilder.updateTool(toolId, updatedConfig);
       
+      // Invalidate specific tool cache since we've updated it
+      const organizationId = this.getOrganizationId(c);
+      invalidateToolCache(organizationId, toolId);
+      
       return c.json({
         success: true,
         data: {
@@ -302,6 +343,10 @@ export class AgentFlowAPI {
           error: 'Tool not found',
         }, 404);
       }
+
+      // Invalidate specific tool cache since we've deleted it
+      const organizationId = this.getOrganizationId(c);
+      invalidateToolCache(organizationId, toolId);
 
       return c.json({
         success: true,
@@ -532,6 +577,10 @@ export class AgentFlowAPI {
       environment: process.env.NODE_ENV || 'development',
       userTier: c.req.header('x-user-tier') || 'free',
     };
+  }
+
+  private getOrganizationId(c: Context): string {
+    return c.req.header('x-organization-id') || 'default';
   }
 
   private createTestRuntimeContext(): any {

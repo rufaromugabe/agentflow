@@ -1,23 +1,15 @@
 import { Pool, PoolClient } from 'pg';
 import { PostgresStore } from '@mastra/pg';
 import { DatabaseSchema, AgentTable, ToolTable, ToolTemplateTable, AgentExecutionTable, ToolExecutionTable, AnalyticsTable } from '../types';
+import { logger } from '../utils/logger';
+import { AgentFlowError, validateOrganizationId } from '../utils/helpers';
+import { getConnectionManager } from './connection-manager';
 
 // PostgreSQL Database Manager
 export class PostgreSQLManager {
-  private pool: Pool;
   private schemas: Map<string, DatabaseSchema> = new Map();
 
   constructor() {
-    // Initialize PostgreSQL connection pool using DATABASE_URL
-    const connectionString = process.env.DATABASE_URL || 'postgresql://user:none@localhost:5432/agentflow';
-    
-    this.pool = new Pool({
-      connectionString,
-      max: 20, // Maximum number of clients in the pool
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 2000,
-    });
-
     this.initializeDefaultSchema();
   }
 
@@ -62,28 +54,32 @@ export class PostgreSQLManager {
 
   // Initialize organization database schema
   async initializeOrganization(organizationId: string): Promise<void> {
-    const schema = this.getSchema(organizationId) || this.createOrganizationSchema(organizationId);
+    const normalizedOrgId = validateOrganizationId(organizationId);
+    const schema = this.getSchema(normalizedOrgId) || this.createOrganizationSchema(normalizedOrgId);
     
-    const client = await this.pool.connect();
+    const connectionManager = getConnectionManager();
+    
     try {
       // Create schema if it doesn't exist
-      await client.query(`CREATE SCHEMA IF NOT EXISTS "${organizationId}"`);
+      await connectionManager.createSchemaIfNotExists(normalizedOrgId);
       
       // Create tables
-      await this.createTables(client, organizationId, schema);
+      await this.createTables(connectionManager, normalizedOrgId, schema);
       
-      console.log(`PostgreSQL schema initialized for organization: ${organizationId}`);
+      logger.info('PostgreSQL schema initialized', { organizationId: normalizedOrgId });
     } catch (error) {
-      console.error(`Error initializing PostgreSQL schema for ${organizationId}:`, error);
-      throw error;
-    } finally {
-      client.release();
+      logger.error('Error initializing PostgreSQL schema', { organizationId: normalizedOrgId }, error instanceof Error ? error : undefined);
+      throw new AgentFlowError(
+        'Failed to initialize PostgreSQL schema',
+        'SCHEMA_INIT_ERROR',
+        { organizationId: normalizedOrgId }
+      );
     }
   }
 
-  private async createTables(client: PoolClient, organizationId: string, schema: DatabaseSchema): Promise<void> {
+  private async createTables(connectionManager: any, organizationId: string, schema: DatabaseSchema): Promise<void> {
     // Create agents table
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".agents (
         id VARCHAR(255) PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
@@ -102,7 +98,7 @@ export class PostgreSQLManager {
     `);
 
     // Create tools table
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".tools (
         id VARCHAR(255) PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
@@ -127,7 +123,7 @@ export class PostgreSQLManager {
     `);
 
     // Create tool_templates table
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".tool_templates (
         id VARCHAR(255) PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
@@ -142,7 +138,7 @@ export class PostgreSQLManager {
     `);
 
     // Create agent_executions table
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".agent_executions (
         id VARCHAR(255) PRIMARY KEY,
         agent_id VARCHAR(255) NOT NULL,
@@ -161,7 +157,7 @@ export class PostgreSQLManager {
     `);
 
     // Create tool_executions table
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".tool_executions (
         id VARCHAR(255) PRIMARY KEY,
         tool_id VARCHAR(255) NOT NULL,
@@ -180,7 +176,7 @@ export class PostgreSQLManager {
     `);
 
     // Create analytics table
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".analytics (
         id VARCHAR(255) PRIMARY KEY,
         agent_id VARCHAR(255),
@@ -195,15 +191,15 @@ export class PostgreSQLManager {
     `);
 
     // Create memory-related tables for Mastra memory system
-    await this.createMemoryTables(client, organizationId);
+    await this.createMemoryTables(connectionManager, organizationId);
 
     // Create indexes
-    await this.createIndexes(client, organizationId);
+    await this.createIndexes(connectionManager, organizationId);
   }
 
-  private async createMemoryTables(client: PoolClient, organizationId: string): Promise<void> {
+  private async createMemoryTables(connectionManager: any, organizationId: string): Promise<void> {
     // Create threads table for conversation threads
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".threads (
         id VARCHAR(255) PRIMARY KEY,
         title VARCHAR(500),
@@ -214,7 +210,7 @@ export class PostgreSQLManager {
     `);
 
     // Create messages table for storing conversation messages
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".messages (
         id VARCHAR(255) PRIMARY KEY,
         thread_id VARCHAR(255) NOT NULL,
@@ -228,7 +224,7 @@ export class PostgreSQLManager {
 
     // Create message_embeddings table for vector storage (only if pgvector is available)
     try {
-      await client.query(`
+      await connectionManager.query(`
         CREATE TABLE IF NOT EXISTS "${organizationId}".message_embeddings (
           id VARCHAR(255) PRIMARY KEY,
           message_id VARCHAR(255) NOT NULL,
@@ -239,7 +235,7 @@ export class PostgreSQLManager {
       `);
     } catch (error) {
       console.warn(`Vector extension not available, creating message_embeddings without vector column: ${error.message}`);
-      await client.query(`
+      await connectionManager.query(`
         CREATE TABLE IF NOT EXISTS "${organizationId}".message_embeddings (
           id VARCHAR(255) PRIMARY KEY,
           message_id VARCHAR(255) NOT NULL,
@@ -251,7 +247,7 @@ export class PostgreSQLManager {
     }
 
     // Create resources table for resource-scoped memory
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".resources (
         id VARCHAR(255) PRIMARY KEY,
         type VARCHAR(50) NOT NULL,
@@ -262,7 +258,7 @@ export class PostgreSQLManager {
     `);
 
     // Create resource_messages table for linking messages to resources
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".resource_messages (
         id VARCHAR(255) PRIMARY KEY,
         resource_id VARCHAR(255) NOT NULL,
@@ -274,7 +270,7 @@ export class PostgreSQLManager {
     `);
 
     // Create working_memory table for temporary memory storage
-    await client.query(`
+    await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".working_memory (
         id VARCHAR(255) PRIMARY KEY,
         thread_id VARCHAR(255),
@@ -289,7 +285,7 @@ export class PostgreSQLManager {
     `);
   }
 
-  private async createIndexes(client: PoolClient, organizationId: string): Promise<void> {
+  private async createIndexes(connectionManager: any, organizationId: string): Promise<void> {
     const indexes = [
       `CREATE INDEX IF NOT EXISTS idx_agents_status ON "${organizationId}".agents (status)`,
       `CREATE INDEX IF NOT EXISTS idx_agents_created_at ON "${organizationId}".agents (created_at)`,
@@ -346,68 +342,66 @@ export class PostgreSQLManager {
     ];
 
     for (const indexQuery of indexes) {
-      await client.query(indexQuery);
+      await connectionManager.query(indexQuery);
     }
   }
 
   // CRUD operations for agents
   async createAgent(organizationId: string, agent: any): Promise<any> {
-    const client = await this.pool.connect();
-    try {
-      const query = `
-        INSERT INTO "${organizationId}".agents 
-        (id, name, description, instructions, model, tools, memory_config, voice_config, status, metadata, created_at, updated_at, workspace_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        RETURNING *
-      `;
-      
-      const values = [
-        agent.id,
-        agent.name,
-        agent.description,
-        agent.instructions,
-        agent.model,
-        JSON.stringify(agent.tools || []),
-        JSON.stringify(agent.memory_config || {}),
-        JSON.stringify(agent.voice_config || {}),
-        agent.status || 'active',
-        JSON.stringify(agent.metadata || {}),
-        agent.created_at || new Date(),
-        agent.updated_at || new Date(),
-        agent.workspace_id || null
-      ];
+    const connectionManager = getConnectionManager();
+    const query = `
+      INSERT INTO "${organizationId}".agents 
+      (id, name, description, instructions, model, tools, memory_config, voice_config, status, metadata, created_at, updated_at, workspace_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      RETURNING *
+    `;
+    
+    const values = [
+      agent.id,
+      agent.name,
+      agent.description,
+      agent.instructions,
+      agent.model,
+      JSON.stringify(agent.tools || []),
+      JSON.stringify(agent.memory_config || {}),
+      JSON.stringify(agent.voice_config || {}),
+      agent.status || 'active',
+      JSON.stringify(agent.metadata || {}),
+      agent.created_at || new Date(),
+      agent.updated_at || new Date(),
+      agent.workspace_id || null
+    ];
 
-      const result = await client.query(query, values);
-      return result.rows[0];
-    } finally {
-      client.release();
-    }
+    const result = await connectionManager.query(query, values);
+    return result[0];
   }
 
   async getAgent(organizationId: string, agentId: string): Promise<any> {
-    const client = await this.pool.connect();
+    const connectionManager = getConnectionManager();
     try {
       const query = `SELECT * FROM "${organizationId}".agents WHERE id = $1`;
-      const result = await client.query(query, [agentId]);
-      return result.rows[0] || null;
-    } finally {
-      client.release();
+      const result = await connectionManager.query(query, [agentId]);
+      return result[0] || null;
+    } catch (error) {
+      logger.error('Database operation failed', { organizationId, operation: 'database_operation' }, error instanceof Error ? error : undefined);
+      throw error;
     }
   }
 
   async listAgents(organizationId: string): Promise<any[]> {
-    const client = await this.pool.connect();
+    const connectionManager = getConnectionManager();
     try {
       const query = `SELECT * FROM "${organizationId}".agents ORDER BY created_at DESC`;
-      const result = await client.query(query);
-      return result.rows;
-    } finally {
-      client.release();
+      const result = await connectionManager.query(query);
+      return result;
+    } catch (error) {
+      logger.error('Database operation failed', { organizationId, operation: 'database_operation' }, error instanceof Error ? error : undefined);
+      throw error;
     }
   }
 
   async updateAgent(organizationId: string, agentId: string, updates: any): Promise<any> {
-    const client = await this.pool.connect();
+    const connectionManager = getConnectionManager();
     try {
       const setClause = Object.keys(updates)
         .map((key, index) => `${key} = $${index + 2}`)
@@ -421,27 +415,29 @@ export class PostgreSQLManager {
       `;
       
       const values = [agentId, ...Object.values(updates)];
-      const result = await client.query(query, values);
-      return result.rows[0];
-    } finally {
-      client.release();
+      const result = await connectionManager.query(query, values);
+      return result[0];
+    } catch (error) {
+      logger.error('Database operation failed', { organizationId, operation: 'database_operation' }, error instanceof Error ? error : undefined);
+      throw error;
     }
   }
 
   async deleteAgent(organizationId: string, agentId: string): Promise<boolean> {
-    const client = await this.pool.connect();
+    const connectionManager = getConnectionManager();
     try {
       const query = `DELETE FROM "${organizationId}".agents WHERE id = $1`;
-      const result = await client.query(query, [agentId]);
-      return (result.rowCount ?? 0) > 0;
-    } finally {
-      client.release();
+      const result = await connectionManager.query(query, [agentId]);
+      return result.length > 0;
+    } catch (error) {
+      logger.error('Database operation failed', { organizationId, operation: 'database_operation' }, error instanceof Error ? error : undefined);
+      throw error;
     }
   }
 
   // CRUD operations for tools
   async createTool(organizationId: string, tool: any): Promise<any> {
-    const client = await this.pool.connect();
+    const connectionManager = getConnectionManager();
     try {
       const query = `
         INSERT INTO "${organizationId}".tools 
@@ -472,37 +468,40 @@ export class PostgreSQLManager {
         tool.workspace_id || null
       ];
 
-      const result = await client.query(query, values);
-      return result.rows[0];
-    } finally {
-      client.release();
+      const result = await connectionManager.query(query, values);
+      return result[0];
+    } catch (error) {
+      logger.error('Database operation failed', { organizationId, operation: 'database_operation' }, error instanceof Error ? error : undefined);
+      throw error;
     }
   }
 
   async getTool(organizationId: string, toolId: string): Promise<any> {
-    const client = await this.pool.connect();
+    const connectionManager = getConnectionManager();
     try {
       const query = `SELECT * FROM "${organizationId}".tools WHERE id = $1`;
-      const result = await client.query(query, [toolId]);
-      return result.rows[0] || null;
-    } finally {
-      client.release();
+      const result = await connectionManager.query(query, [toolId]);
+      return result[0] || null;
+    } catch (error) {
+      logger.error('Database operation failed', { organizationId, operation: 'database_operation' }, error instanceof Error ? error : undefined);
+      throw error;
     }
   }
 
   async listTools(organizationId: string): Promise<any[]> {
-    const client = await this.pool.connect();
+    const connectionManager = getConnectionManager();
     try {
       const query = `SELECT * FROM "${organizationId}".tools ORDER BY created_at DESC`;
-      const result = await client.query(query);
-      return result.rows;
-    } finally {
-      client.release();
+      const result = await connectionManager.query(query);
+      return result;
+    } catch (error) {
+      logger.error('Database operation failed', { organizationId, operation: 'database_operation' }, error instanceof Error ? error : undefined);
+      throw error;
     }
   }
 
   async updateTool(organizationId: string, toolId: string, updates: any): Promise<any> {
-    const client = await this.pool.connect();
+    const connectionManager = getConnectionManager();
     try {
       const setClause = Object.keys(updates)
         .map((key, index) => `${key} = $${index + 2}`)
@@ -516,21 +515,23 @@ export class PostgreSQLManager {
       `;
       
       const values = [toolId, ...Object.values(updates)];
-      const result = await client.query(query, values);
-      return result.rows[0];
-    } finally {
-      client.release();
+      const result = await connectionManager.query(query, values);
+      return result[0];
+    } catch (error) {
+      logger.error('Database operation failed', { organizationId, operation: 'database_operation' }, error instanceof Error ? error : undefined);
+      throw error;
     }
   }
 
   async deleteTool(organizationId: string, toolId: string): Promise<boolean> {
-    const client = await this.pool.connect();
+    const connectionManager = getConnectionManager();
     try {
       const query = `DELETE FROM "${organizationId}".tools WHERE id = $1`;
-      const result = await client.query(query, [toolId]);
-      return (result.rowCount ?? 0) > 0;
-    } finally {
-      client.release();
+      const result = await connectionManager.query(query, [toolId]);
+      return result.length > 0;
+    } catch (error) {
+      logger.error('Database operation failed', { organizationId, operation: 'database_operation' }, error instanceof Error ? error : undefined);
+      throw error;
     }
   }
 
@@ -641,10 +642,7 @@ export class PostgreSQLManager {
     };
   }
 
-  // Close the connection pool
-  async close(): Promise<void> {
-    await this.pool.end();
-  }
+  // Close method removed - using centralized connection manager
 }
 
 // Export singleton instance

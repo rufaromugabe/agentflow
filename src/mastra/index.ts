@@ -1,11 +1,13 @@
 // Main entry point for the AgentFlow platform
 import { Mastra } from '@mastra/core/mastra';
-import { agentBuilder, toolBuilder, setupAgentFlow } from './platform';
+import { getAgentBuilder, getToolBuilder, setupAgentFlow } from './platform';
 import { createCustomRoutes } from './api/custom-routes';
+import { logger } from './utils/logger';
 
 // Function to load dynamic agents from database
-async function loadDynamicAgents() {
+async function loadDynamicAgents(organizationId: string = 'default') {
   try {
+    const agentBuilder = getAgentBuilder(organizationId);
     // Get all agents from the database
     const agentConfigs = await agentBuilder.listAgents();
     const agents: Record<string, any> = {};
@@ -20,20 +22,24 @@ async function loadDynamicAgents() {
       }
     }
 
+    logger.info('Dynamic agents loaded', { agentCount: Object.keys(agents).length, organizationId });
     return agents;
   } catch (error) {
-    console.error('Error loading dynamic agents:', error);
+    logger.error('Error loading dynamic agents', { organizationId }, error instanceof Error ? error : undefined);
     return {};
   }
 }
 
 // Initialize the platform first
-await setupAgentFlow(undefined, 'default');
+const organizationId = 'default';
+await setupAgentFlow(undefined, organizationId);
 
 // Initialize dynamic agents
-const dynamicAgents = await loadDynamicAgents();
+const dynamicAgents = await loadDynamicAgents(organizationId);
 
 // Create custom routes
+const agentBuilder = getAgentBuilder(organizationId);
+const toolBuilder = getToolBuilder(organizationId);
 const customRoutes = createCustomRoutes(agentBuilder, toolBuilder);
 
 // Create the main Mastra instance with dynamic agents and custom routes
@@ -47,3 +53,5 @@ export const mastra = new Mastra({
     },
   },
 });
+
+logger.info('AgentFlow platform initialized successfully', { organizationId });

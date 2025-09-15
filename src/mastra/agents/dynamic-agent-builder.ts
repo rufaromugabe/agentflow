@@ -4,6 +4,9 @@ import { openai } from '@ai-sdk/openai';
 import { z } from 'zod';
 import { postgresManager } from '../database/postgres-manager';
 import { createDynamicToolBuilder } from '../tools/dynamic-tool-builder';
+import { logger } from '../utils/logger';
+import { AgentFlowError, safeJsonParse, safeJsonStringify, validateOrganizationId } from '../utils/helpers';
+import { cacheManager, cacheKey, invalidateAgentCache } from '../utils/cache';
 
 // Types for dynamic agent configuration
 export interface AgentConfig {
@@ -55,7 +58,7 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
   private organizationId: string = 'default';
 
   constructor(organizationId: string = 'default') {
-    this.organizationId = organizationId;
+    this.organizationId = validateOrganizationId(organizationId);
     this.initializeDefaultTools();
   }
 
@@ -81,11 +84,17 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
       const { initializeOrganizationMemory } = require('../memory/organization-memory');
       await initializeOrganizationMemory(this.organizationId);
       
-      console.log(`Dynamic agent builder initialized for organization: ${this.organizationId}`);
-      console.log(`Loaded ${this.toolRegistry.size} tools from database`);
+      logger.info('Dynamic agent builder initialized', { 
+        organizationId: this.organizationId, 
+        toolCount: this.toolRegistry.size 
+      });
     } catch (error) {
-      console.error(`Failed to initialize dynamic agent builder for ${this.organizationId}:`, error);
-      throw error;
+      logger.error('Failed to initialize dynamic agent builder', { organizationId: this.organizationId }, error instanceof Error ? error : undefined);
+      throw new AgentFlowError(
+        'Failed to initialize dynamic agent builder',
+        'AGENT_BUILDER_INIT_ERROR',
+        { organizationId: this.organizationId }
+      );
     }
   }
 
@@ -95,17 +104,58 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
   }
 
   async createAgent(config: AgentConfig): Promise<Agent> {
-    // Create agent instance
-    const agent = await this.createAgentInstance(config);
+    // Check if agent already exists in memory
+    if (this.configs.has(config.id)) {
+      throw new AgentFlowError(
+        `Agent with ID '${config.id}' already exists`,
+        'AGENT_ALREADY_EXISTS',
+        { agentId: config.id, organizationId: this.organizationId }
+      );
+    }
 
-    // Convert AgentConfig to database format and save to PostgreSQL
-    const dbData = this.convertAgentConfigToDbRow(config);
-    await postgresManager.createAgent(this.organizationId, dbData);
+    // Check if agent already exists in database
+    const existingDbAgent = await postgresManager.getAgent(this.organizationId, config.id);
+    if (existingDbAgent) {
+      throw new AgentFlowError(
+        `Agent with ID '${config.id}' already exists in database`,
+        'AGENT_ALREADY_EXISTS',
+        { agentId: config.id, organizationId: this.organizationId }
+      );
+    }
 
-    this.agents.set(config.id, agent);
-    this.configs.set(config.id, config);
-    
-    return agent;
+    try {
+      // Create agent instance
+      const agent = await this.createAgentInstance(config);
+
+      // Convert AgentConfig to database format and save to PostgreSQL
+      const dbData = this.convertAgentConfigToDbRow(config);
+      await postgresManager.createAgent(this.organizationId, dbData);
+
+      this.agents.set(config.id, agent);
+      this.configs.set(config.id, config);
+      
+      // Invalidate agent cache since we've created a new agent
+      invalidateAgentCache(this.organizationId);
+      
+      logger.info('Agent created and cache invalidated', { 
+        agentId: config.id, 
+        organizationId: this.organizationId 
+      });
+      
+      return agent;
+    } catch (error) {
+      // Handle database constraint violations
+      if (error instanceof Error && error.message.includes('duplicate key value violates unique constraint')) {
+        throw new AgentFlowError(
+          `Agent with ID '${config.id}' already exists`,
+          'AGENT_ALREADY_EXISTS',
+          { agentId: config.id, organizationId: this.organizationId }
+        );
+      }
+      
+      // Re-throw other errors
+      throw error;
+    }
   }
 
   private async createAgentInstance(config: AgentConfig): Promise<Agent> {
@@ -135,26 +185,13 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
   }
 
   private convertDbRowToAgentConfig(dbRow: any): AgentConfig {
-    // Helper function to safely parse JSON
-    const safeJsonParse = (value: any, defaultValue: any = null) => {
-      if (!value) return defaultValue;
-      if (typeof value === 'string') {
-        try {
-          return JSON.parse(value);
-        } catch {
-          return defaultValue;
-        }
-      }
-      return value;
-    };
-
     const config = {
       id: dbRow.id,
       name: dbRow.name,
       description: dbRow.description,
       instructions: dbRow.instructions,
       model: dbRow.model,
-      tools: safeJsonParse(dbRow.tools, []),
+      tools: safeJsonParse(dbRow.tools, []) || [],
       memory: safeJsonParse(dbRow.memory_config),
       voice: safeJsonParse(dbRow.voice_config),
       status: dbRow.status,
@@ -163,7 +200,11 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
       updatedAt: new Date(dbRow.updated_at),
     };
 
-    console.log(`Converting database row to agent config for ${config.id}: model = ${config.model}`);
+    logger.debug('Converting database row to agent config', { 
+      agentId: config.id, 
+      model: config.model, 
+      organizationId: this.organizationId 
+    });
     return config;
   }
 
@@ -174,11 +215,11 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
       description: config.description,
       instructions: config.instructions,
       model: config.model,
-      tools: JSON.stringify(config.tools),
-      memory_config: config.memory ? JSON.stringify(config.memory) : null,
-      voice_config: config.voice ? JSON.stringify(config.voice) : null,
+      tools: safeJsonStringify(config.tools),
+      memory_config: config.memory ? safeJsonStringify(config.memory) : null,
+      voice_config: config.voice ? safeJsonStringify(config.voice) : null,
       status: config.status,
-      metadata: config.metadata ? JSON.stringify(config.metadata) : null,
+      metadata: config.metadata ? safeJsonStringify(config.metadata) : null,
       created_at: config.createdAt,
       updated_at: config.updatedAt,
     };
@@ -191,11 +232,11 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
     if (updates.description !== undefined) dbUpdates.description = updates.description;
     if (updates.instructions !== undefined) dbUpdates.instructions = updates.instructions;
     if (updates.model !== undefined) dbUpdates.model = updates.model;
-    if (updates.tools !== undefined) dbUpdates.tools = JSON.stringify(updates.tools);
-    if (updates.memory !== undefined) dbUpdates.memory_config = updates.memory ? JSON.stringify(updates.memory) : null;
-    if (updates.voice !== undefined) dbUpdates.voice_config = updates.voice ? JSON.stringify(updates.voice) : null;
+    if (updates.tools !== undefined) dbUpdates.tools = safeJsonStringify(updates.tools);
+    if (updates.memory !== undefined) dbUpdates.memory_config = updates.memory ? safeJsonStringify(updates.memory) : null;
+    if (updates.voice !== undefined) dbUpdates.voice_config = updates.voice ? safeJsonStringify(updates.voice) : null;
     if (updates.status !== undefined) dbUpdates.status = updates.status;
-    if (updates.metadata !== undefined) dbUpdates.metadata = updates.metadata ? JSON.stringify(updates.metadata) : null;
+    if (updates.metadata !== undefined) dbUpdates.metadata = updates.metadata ? safeJsonStringify(updates.metadata) : null;
     if (updates.createdAt !== undefined) dbUpdates.created_at = updates.createdAt;
     if (updates.updatedAt !== undefined) dbUpdates.updated_at = updates.updatedAt;
     
@@ -205,7 +246,11 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
   async updateAgent(agentId: string, updates: Partial<AgentConfig>): Promise<Agent> {
     const existingConfig = this.configs.get(agentId);
     if (!existingConfig) {
-      throw new Error(`Agent with ID ${agentId} not found`);
+      throw new AgentFlowError(
+        `Agent with ID ${agentId} not found`,
+        'AGENT_NOT_FOUND',
+        { agentId, organizationId: this.organizationId }
+      );
     }
 
     const updatedConfig = {
@@ -223,14 +268,31 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
     this.agents.set(agentId, updatedAgent);
     this.configs.set(agentId, updatedConfig);
 
+    // Invalidate specific agent cache since we've updated it
+    invalidateAgentCache(this.organizationId, agentId);
+    
+    logger.info('Agent updated and cache invalidated', { 
+      agentId, 
+      organizationId: this.organizationId,
+      updatedFields: Object.keys(updates)
+    });
+
     return updatedAgent;
   }
 
   async getAgent(agentId: string): Promise<Agent | null> {
-    // Try to get from cache first
+    // Try to get from memory cache first
     let agent = this.agents.get(agentId);
     if (agent) {
       return agent;
+    }
+
+    // Try to get from centralized cache
+    const cacheKeyStr = cacheKey('agent', this.organizationId, agentId);
+    const cachedAgent = cacheManager.get<Agent>(cacheKeyStr);
+    if (cachedAgent) {
+      this.agents.set(agentId, cachedAgent);
+      return cachedAgent;
     }
 
     // Load from PostgreSQL if not in cache
@@ -240,6 +302,10 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
       agent = await this.createAgentInstance(config);
       this.agents.set(agentId, agent);
       this.configs.set(agentId, config);
+      
+      // Cache the agent for future use
+      cacheManager.set(cacheKeyStr, agent, 300); // 5 minutes
+      
       return agent;
     }
 
@@ -270,6 +336,14 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
       // Remove from cache
       this.agents.delete(agentId);
       this.configs.delete(agentId);
+      
+      // Invalidate specific agent cache since we've deleted it
+      invalidateAgentCache(this.organizationId, agentId);
+      
+      logger.info('Agent deleted and cache invalidated', { 
+        agentId, 
+        organizationId: this.organizationId 
+      });
     }
 
     return deleted;
@@ -302,12 +376,21 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
   private selectModel(config: AgentConfig, context?: AgentRuntimeContext) {
     // Use the model from the configuration (database) as the primary choice
     if (config.model) {
-      console.log(`Using model from database config: ${config.model} for agent ${config.id}`);
+      logger.debug('Using model from database config', { 
+        model: config.model, 
+        agentId: config.id, 
+        organizationId: this.organizationId 
+      });
       return openai(config.model);
     }
     
     // Fallback to tier-based selection if no model is specified in config
-    console.log(`No model specified in config for agent ${config.id}, using tier-based selection`);
+    logger.debug('No model specified in config, using tier-based selection', { 
+      agentId: config.id, 
+      userTier: context?.userTier,
+      organizationId: this.organizationId 
+    });
+    
     if (context?.userTier === 'enterprise') {
       return openai('gpt-4o'); // Premium model for enterprise
     } else if (context?.userTier === 'pro') {
@@ -406,7 +489,10 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
         }
       }
       
-      console.log(`Refreshed ${this.toolRegistry.size} tools from database`);
+      logger.info('Refreshed tools from database', { 
+        toolCount: this.toolRegistry.size, 
+        organizationId: this.organizationId 
+      });
     }
   }
 
