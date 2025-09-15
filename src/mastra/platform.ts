@@ -5,33 +5,37 @@ import { createDynamicToolBuilder } from './tools/dynamic-tool-builder';
 import { postgresManager } from './database/postgres-manager';
 
 // Initialize the dynamic builders
-export const agentBuilder = createDynamicAgentBuilder();
-export const toolBuilder = createDynamicToolBuilder();
+export const agentBuilder = createDynamicAgentBuilder('default');
+export const toolBuilder = createDynamicToolBuilder('default');
 
 // Initialize platform with sample data
 async function initializePlatform() {
   try {
     console.log('Starting AgentFlow platform initialization...');
     
-    // Step 1: Initialize database schema
-    console.log('Step 1: Initializing database schema...');
-    await postgresManager.initializeOrganization('default');
-    console.log('✅ Database schema initialized');
+    // Step 1: Initialize tool builder (this will initialize database and load tools)
+    console.log('Step 1: Initializing tool builder...');
+    await toolBuilder.initialize();
+    console.log('✅ Tool builder initialized and tools loaded');
     
-    // Step 2: Create and load tools
-    console.log('Step 2: Setting up tools...');
+    // Step 2: Create sample tools if they don't exist
+    console.log('Step 2: Setting up sample tools...');
     await createSampleTools();
-    await loadToolsFromDatabase();
-    console.log('✅ Tools initialized and loaded');
+    console.log('✅ Sample tools setup complete');
     
-    // Step 3: Create and load agents
-    console.log('Step 3: Setting up agents...');
+    // Step 3: Register tools with agent builder
+    console.log('Step 3: Registering tools with agent builder...');
+    await registerToolsWithAgents();
+    console.log('✅ Tools registered with agent builder');
+    
+    // Step 4: Create and load agents
+    console.log('Step 4: Setting up agents...');
     await createSampleAgents();
     await loadAgentsFromDatabase();
     console.log('✅ Agents initialized and loaded');
     
-    // Step 4: Verify initialization
-    console.log('Step 4: Verifying initialization...');
+    // Step 5: Verify initialization
+    console.log('Step 5: Verifying initialization...');
     await verifyInitialization();
     
     console.log('🎉 AgentFlow platform initialized successfully with dynamic agents and tools');
@@ -114,7 +118,7 @@ async function createSampleTools() {
     console.log('Weather tool saved to database:', savedTool.id);
 
     // Also create the tool in the tool builder for runtime use
-    const weatherTool = toolBuilder.createToolFromTemplate('weather-api', {
+    const weatherTool = await toolBuilder.createToolFromTemplate('weather-api', {
       id: 'weather-tool',
       name: 'Weather Tool',
       description: 'Get current weather information for any location',
@@ -153,64 +157,23 @@ async function createSampleTools() {
   }
 }
 
-// Load tools from database into tool builder
-async function loadToolsFromDatabase() {
+// Register tools with agent builder after they're loaded
+async function registerToolsWithAgents() {
   try {
-    const dbTools = await postgresManager.listTools('default');
-    console.log(`Loading ${dbTools.length} tools from database...`);
+    const tools = toolBuilder.listTools();
+    console.log(`Registering ${tools.length} tools with agent builder...`);
     
-    for (const dbTool of dbTools) {
-      try {
-        // Helper function to safely parse JSON
-        const safeJsonParse = (value: any, defaultValue: any = null) => {
-          if (!value) return defaultValue;
-          if (typeof value === 'string') {
-            try {
-              return JSON.parse(value);
-            } catch {
-              return defaultValue;
-            }
-          }
-          return value;
-        };
-
-        // Create tool configuration from database row
-        const toolConfig = {
-          id: dbTool.id,
-          name: dbTool.name,
-          description: dbTool.description,
-          inputSchema: safeJsonParse(dbTool.input_schema, {}),
-          outputSchema: safeJsonParse(dbTool.output_schema),
-          apiEndpoint: dbTool.api_endpoint,
-          method: dbTool.method,
-          headers: safeJsonParse(dbTool.headers),
-          authentication: safeJsonParse(dbTool.authentication),
-          rateLimit: safeJsonParse(dbTool.rate_limit),
-          timeout: dbTool.timeout,
-          retries: dbTool.retries,
-          cache: safeJsonParse(dbTool.cache_config),
-          validation: safeJsonParse(dbTool.validation_config),
-          status: dbTool.status,
-          metadata: safeJsonParse(dbTool.metadata),
-          createdAt: new Date(dbTool.created_at),
-          updatedAt: new Date(dbTool.updated_at),
-        };
-
-        // Create tool instance in tool builder
-        const tool = toolBuilder.createTool(toolConfig);
-        
-        // Register with agent builder
-        agentBuilder.registerTool(dbTool.id, tool);
-        
-        console.log(`✅ Loaded tool: ${dbTool.name} (${dbTool.id})`);
-      } catch (toolError) {
-        console.error(`❌ Error loading tool ${dbTool.id}:`, toolError);
+    for (const toolConfig of tools) {
+      const tool = toolBuilder.getTool(toolConfig.id);
+      if (tool) {
+        agentBuilder.registerTool(toolConfig.id, tool);
+        console.log(`✅ Registered tool: ${toolConfig.name} (${toolConfig.id})`);
       }
     }
     
-    console.log(`Successfully loaded ${dbTools.length} tools from database`);
+    console.log(`Successfully registered ${tools.length} tools with agent builder`);
   } catch (error) {
-    console.error('Error loading tools from database:', error);
+    console.error('Error registering tools with agent builder:', error);
     throw error;
   }
 }
@@ -352,20 +315,24 @@ export * from './types';
 export { postgresManager };
 
 // Export initialization functions
-export { loadToolsFromDatabase, loadAgentsFromDatabase, verifyInitialization };
+export { registerToolsWithAgents, loadAgentsFromDatabase, verifyInitialization };
 
 // Initialize function for setting up the platform
 export async function initializeAgentFlow(organizationId: string = 'default'): Promise<void> {
   try {
     console.log(`Starting AgentFlow platform initialization for organization: ${organizationId}`);
     
-    // Initialize database schema for the organization
-    await postgresManager.initializeOrganization(organizationId);
-    console.log(`✅ Database schema initialized for organization: ${organizationId}`);
+    // Initialize tool builder (this will initialize database and load tools)
+    await toolBuilder.initialize();
+    console.log(`✅ Tool builder initialized for organization: ${organizationId}`);
     
-    // Load existing tools and agents from database
-    await loadToolsFromDatabase();
+    // Register tools with agent builder
+    await registerToolsWithAgents();
+    console.log(`✅ Tools registered with agent builder for organization: ${organizationId}`);
+    
+    // Load existing agents from database
     await loadAgentsFromDatabase();
+    console.log(`✅ Agents loaded for organization: ${organizationId}`);
     
     // Verify initialization
     await verifyInitialization();
@@ -453,7 +420,7 @@ export async function createSampleAgentAndTool(): Promise<void> {
   console.log('Sample weather tool saved to database:', savedTool.id);
 
   // Create a sample tool for runtime use
-  const weatherTool = toolBuilder.createToolFromTemplate('weather-api', {
+  const weatherTool = await toolBuilder.createToolFromTemplate('weather-api', {
     id: 'sample-weather-tool',
     name: 'Sample Weather Tool',
     description: 'Get current weather information for any location',

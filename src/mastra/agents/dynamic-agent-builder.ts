@@ -116,7 +116,7 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
       return value;
     };
 
-    return {
+    const config = {
       id: dbRow.id,
       name: dbRow.name,
       description: dbRow.description,
@@ -130,6 +130,9 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
       createdAt: new Date(dbRow.created_at),
       updatedAt: new Date(dbRow.updated_at),
     };
+
+    console.log(`Converting database row to agent config for ${config.id}: model = ${config.model}`);
+    return config;
   }
 
   private convertAgentConfigToDbRow(config: AgentConfig): any {
@@ -265,7 +268,14 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
   }
 
   private selectModel(config: AgentConfig, context?: AgentRuntimeContext) {
-    // Select model based on user tier and configuration
+    // Use the model from the configuration (database) as the primary choice
+    if (config.model) {
+      console.log(`Using model from database config: ${config.model} for agent ${config.id}`);
+      return openai(config.model);
+    }
+    
+    // Fallback to tier-based selection if no model is specified in config
+    console.log(`No model specified in config for agent ${config.id}, using tier-based selection`);
     if (context?.userTier === 'enterprise') {
       return openai('gpt-4o'); // Premium model for enterprise
     } else if (context?.userTier === 'pro') {

@@ -1,6 +1,7 @@
 import { createTool } from '@mastra/core/tools';
 import { RuntimeContext } from '@mastra/core/runtime-context';
 import { z } from 'zod';
+import { postgresManager } from '../database/postgres-manager';
 
 // Types for dynamic tool configuration
 export interface ToolConfig {
@@ -47,12 +48,13 @@ export interface ToolTemplate {
 }
 
 export interface DynamicToolBuilder {
-  createTool(config: ToolConfig): any;
-  createToolFromTemplate(templateId: string, customizations: Partial<ToolConfig>): any;
-  updateTool(toolId: string, updates: Partial<ToolConfig>): any;
+  initialize(): Promise<void>;
+  createTool(config: ToolConfig): Promise<any>;
+  createToolFromTemplate(templateId: string, customizations: Partial<ToolConfig>): Promise<any>;
+  updateTool(toolId: string, updates: Partial<ToolConfig>): Promise<any>;
   getTool(toolId: string): any | null;
   listTools(): ToolConfig[];
-  deleteTool(toolId: string): boolean;
+  deleteTool(toolId: string): Promise<boolean>;
   createTemplate(template: ToolTemplate): ToolTemplate;
   getTemplates(): ToolTemplate[];
   validateToolConfig(config: ToolConfig): { valid: boolean; errors: string[] };
@@ -64,9 +66,65 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
   private configs: Map<string, ToolConfig> = new Map();
   private templates: Map<string, ToolTemplate> = new Map();
   private cache: Map<string, { data: any; timestamp: number; ttl: number }> = new Map();
+  private organizationId: string;
 
-  constructor() {
+  constructor(organizationId: string = 'default') {
+    this.organizationId = organizationId;
     this.initializeDefaultTemplates();
+  }
+
+  async initialize(): Promise<void> {
+    try {
+      await postgresManager.initializeOrganization(this.organizationId);
+      // Load existing tools from database
+      await this.loadToolsFromDatabase();
+    } catch (error) {
+      console.error('Failed to initialize database for tools:', error);
+    }
+  }
+
+  private async loadToolsFromDatabase() {
+    try {
+      const dbTools = await postgresManager.listTools(this.organizationId);
+      for (const dbTool of dbTools) {
+        const config: ToolConfig = {
+          id: dbTool.id,
+          name: dbTool.name,
+          description: dbTool.description,
+          inputSchema: dbTool.input_schema,
+          outputSchema: dbTool.output_schema,
+          apiEndpoint: dbTool.api_endpoint,
+          method: dbTool.method,
+          headers: dbTool.headers,
+          authentication: dbTool.authentication,
+          rateLimit: dbTool.rate_limit,
+          timeout: dbTool.timeout,
+          retries: dbTool.retries,
+          cache: dbTool.cache_config,
+          validation: dbTool.validation_config,
+          status: dbTool.status,
+          metadata: dbTool.metadata,
+          createdAt: new Date(dbTool.created_at),
+          updatedAt: new Date(dbTool.updated_at),
+        };
+        
+        // Create the tool instance and store in memory
+        const tool = createTool({
+          id: config.id,
+          description: config.description,
+          inputSchema: this.buildInputSchema(config.inputSchema),
+          outputSchema: config.outputSchema ? this.buildOutputSchema(config.outputSchema) : undefined,
+          execute: async ({ context, runtimeContext }, options) => {
+            return await this.executeTool(config, context, runtimeContext, options?.abortSignal);
+          },
+        });
+
+        this.tools.set(config.id, tool);
+        this.configs.set(config.id, config);
+      }
+    } catch (error) {
+      console.error('Failed to load tools from database:', error);
+    }
   }
 
   private initializeDefaultTemplates() {
@@ -163,29 +221,106 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     this.templates.set(databaseTemplate.id, databaseTemplate);
   }
 
-  createTool(config: ToolConfig): any {
+  async createTool(config: ToolConfig): Promise<any> {
     const validation = this.validateToolConfig(config);
     if (!validation.valid) {
       throw new Error(`Invalid tool configuration: ${validation.errors.join(', ')}`);
     }
 
-    const tool = createTool({
-      id: config.id,
-      description: config.description,
-      inputSchema: this.buildInputSchema(config.inputSchema),
-      outputSchema: config.outputSchema ? this.buildOutputSchema(config.outputSchema) : undefined,
-      execute: async ({ context, runtimeContext }, options) => {
-        return await this.executeTool(config, context, runtimeContext, options?.abortSignal);
-      },
-    });
+    // Check if tool already exists in memory
+    if (this.configs.has(config.id)) {
+      console.log(`Tool with ID ${config.id} already exists in memory, returning existing tool`);
+      return this.tools.get(config.id);
+    }
 
-    this.tools.set(config.id, tool);
-    this.configs.set(config.id, config);
+    try {
+      // Check if tool exists in database first
+      const existingDbTool = await postgresManager.getTool(this.organizationId, config.id);
+      if (existingDbTool) {
+        console.log(`Tool with ID ${config.id} already exists in database, loading into memory`);
+        // Load the existing tool into memory
+        const existingConfig: ToolConfig = {
+          id: existingDbTool.id,
+          name: existingDbTool.name,
+          description: existingDbTool.description,
+          inputSchema: existingDbTool.input_schema,
+          outputSchema: existingDbTool.output_schema,
+          apiEndpoint: existingDbTool.api_endpoint,
+          method: existingDbTool.method,
+          headers: existingDbTool.headers,
+          authentication: existingDbTool.authentication,
+          rateLimit: existingDbTool.rate_limit,
+          timeout: existingDbTool.timeout,
+          retries: existingDbTool.retries,
+          cache: existingDbTool.cache_config,
+          validation: existingDbTool.validation_config,
+          status: existingDbTool.status,
+          metadata: existingDbTool.metadata,
+          createdAt: new Date(existingDbTool.created_at),
+          updatedAt: new Date(existingDbTool.updated_at),
+        };
 
-    return tool;
+        const tool = createTool({
+          id: existingConfig.id,
+          description: existingConfig.description,
+          inputSchema: this.buildInputSchema(existingConfig.inputSchema),
+          outputSchema: existingConfig.outputSchema ? this.buildOutputSchema(existingConfig.outputSchema) : undefined,
+          execute: async ({ context, runtimeContext }, options) => {
+            return await this.executeTool(existingConfig, context, runtimeContext, options?.abortSignal);
+          },
+        });
+
+        this.tools.set(existingConfig.id, tool);
+        this.configs.set(existingConfig.id, existingConfig);
+        return tool;
+      }
+
+      // Persist to database first
+      const dbTool = await postgresManager.createTool(this.organizationId, {
+        id: config.id,
+        name: config.name,
+        description: config.description,
+        input_schema: config.inputSchema,
+        output_schema: config.outputSchema,
+        api_endpoint: config.apiEndpoint,
+        method: config.method,
+        headers: config.headers,
+        authentication: config.authentication,
+        rate_limit: config.rateLimit,
+        timeout: config.timeout,
+        retries: config.retries,
+        cache_config: config.cache,
+        validation_config: config.validation,
+        status: config.status,
+        metadata: config.metadata,
+        created_at: config.createdAt,
+        updated_at: config.updatedAt,
+        workspace_id: null, // TODO: Add workspace support
+      });
+
+      // Create the tool instance
+      const tool = createTool({
+        id: config.id,
+        description: config.description,
+        inputSchema: this.buildInputSchema(config.inputSchema),
+        outputSchema: config.outputSchema ? this.buildOutputSchema(config.outputSchema) : undefined,
+        execute: async ({ context, runtimeContext }, options) => {
+          return await this.executeTool(config, context, runtimeContext, options?.abortSignal);
+        },
+      });
+
+      // Store in memory
+      this.tools.set(config.id, tool);
+      this.configs.set(config.id, config);
+
+      return tool;
+    } catch (error) {
+      console.error('Failed to create tool in database:', error);
+      throw new Error(`Failed to create tool: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
-  createToolFromTemplate(templateId: string, customizations: Partial<ToolConfig>): any {
+  async createToolFromTemplate(templateId: string, customizations: Partial<ToolConfig>): Promise<any> {
     const template = this.templates.get(templateId);
     if (!template) {
       throw new Error(`Template with ID ${templateId} not found`);
@@ -212,10 +347,10 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       metadata: { ...template.template, ...customizations.metadata },
     };
 
-    return this.createTool(config);
+    return await this.createTool(config);
   }
 
-  updateTool(toolId: string, updates: Partial<ToolConfig>): any {
+  async updateTool(toolId: string, updates: Partial<ToolConfig>): Promise<any> {
     const existingConfig = this.configs.get(toolId);
     if (!existingConfig) {
       throw new Error(`Tool with ID ${toolId} not found`);
@@ -227,12 +362,37 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       updatedAt: new Date(),
     };
 
-    // Recreate tool with updated configuration
-    const updatedTool = this.createTool(updatedConfig);
-    this.tools.set(toolId, updatedTool);
-    this.configs.set(toolId, updatedConfig);
+    try {
+      // Update in database
+      const dbUpdates: any = {};
+      if (updates.name !== undefined) dbUpdates.name = updates.name;
+      if (updates.description !== undefined) dbUpdates.description = updates.description;
+      if (updates.inputSchema !== undefined) dbUpdates.input_schema = updates.inputSchema;
+      if (updates.outputSchema !== undefined) dbUpdates.output_schema = updates.outputSchema;
+      if (updates.apiEndpoint !== undefined) dbUpdates.api_endpoint = updates.apiEndpoint;
+      if (updates.method !== undefined) dbUpdates.method = updates.method;
+      if (updates.headers !== undefined) dbUpdates.headers = updates.headers;
+      if (updates.authentication !== undefined) dbUpdates.authentication = updates.authentication;
+      if (updates.rateLimit !== undefined) dbUpdates.rate_limit = updates.rateLimit;
+      if (updates.timeout !== undefined) dbUpdates.timeout = updates.timeout;
+      if (updates.retries !== undefined) dbUpdates.retries = updates.retries;
+      if (updates.cache !== undefined) dbUpdates.cache_config = updates.cache;
+      if (updates.validation !== undefined) dbUpdates.validation_config = updates.validation;
+      if (updates.status !== undefined) dbUpdates.status = updates.status;
+      if (updates.metadata !== undefined) dbUpdates.metadata = updates.metadata;
 
-    return updatedTool;
+      await postgresManager.updateTool(this.organizationId, toolId, dbUpdates);
+
+      // Recreate tool with updated configuration
+      const updatedTool = await this.createTool(updatedConfig);
+      this.tools.set(toolId, updatedTool);
+      this.configs.set(toolId, updatedConfig);
+
+      return updatedTool;
+    } catch (error) {
+      console.error('Failed to update tool in database:', error);
+      throw new Error(`Failed to update tool: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   getTool(toolId: string): any | null {
@@ -243,9 +403,23 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     return Array.from(this.configs.values());
   }
 
-  deleteTool(toolId: string): boolean {
-    const deleted = this.tools.delete(toolId) && this.configs.delete(toolId);
-    return deleted;
+  async deleteTool(toolId: string): Promise<boolean> {
+    try {
+      // Delete from database
+      const dbDeleted = await postgresManager.deleteTool(this.organizationId, toolId);
+      
+      if (dbDeleted) {
+        // Remove from memory
+        this.tools.delete(toolId);
+        this.configs.delete(toolId);
+        return true;
+      }
+      
+      return false;
+    } catch (error) {
+      console.error('Failed to delete tool from database:', error);
+      throw new Error(`Failed to delete tool: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   createTemplate(template: ToolTemplate): ToolTemplate {
@@ -345,7 +519,34 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
   ): Promise<any> {
     const url = this.buildApiUrl(config, context);
     const headers = this.buildHeaders(config);
-    const body = config.method !== 'GET' ? JSON.stringify(context) : undefined;
+    
+    // Build request body based on API type
+    let body: string | undefined;
+    if (config.method !== 'GET') {
+      if (config.metadata?.apiType === 'gemini') {
+        // Special handling for Gemini API
+        body = JSON.stringify({
+          contents: [{
+            parts: [{
+              text: context.text
+            }]
+          }],
+          generationConfig: {
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 1024,
+          }
+        });
+      } else {
+        // Default: send context as JSON
+        body = JSON.stringify(context);
+      }
+    }
+
+    console.log(`Making API call to: ${url}`);
+    console.log(`Headers:`, headers);
+    console.log(`Body:`, body);
 
     const response = await fetch(url, {
       method: config.method,
@@ -355,6 +556,9 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     });
 
     if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`API call failed: ${response.status} ${response.statusText}`);
+      console.error(`Response body:`, errorText);
       throw new Error(`API call failed: ${response.status} ${response.statusText}`);
     }
 
@@ -382,17 +586,25 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       url = url.replace(`{${key}}`, encodeURIComponent(context[key]));
     });
 
-    // Add query parameters for GET requests
+    // Add query parameters for GET requests or when API key should be in query
+    const params = new URLSearchParams();
+    
+    // Add API key as query parameter if configured that way
+    if (config.authentication?.type === 'api_key' && config.authentication.config.in === 'query') {
+      params.append(config.authentication.config.name || 'key', config.authentication.config.value);
+    }
+    
+    // Add context parameters for GET requests
     if (config.method === 'GET') {
-      const params = new URLSearchParams();
       Object.keys(context).forEach(key => {
         if (typeof context[key] === 'string' || typeof context[key] === 'number') {
           params.append(key, context[key].toString());
         }
       });
-      if (params.toString()) {
-        url += (url.includes('?') ? '&' : '?') + params.toString();
-      }
+    }
+    
+    if (params.toString()) {
+      url += (url.includes('?') ? '&' : '?') + params.toString();
     }
 
     return url;
@@ -405,7 +617,13 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     if (config.authentication) {
       switch (config.authentication.type) {
         case 'api_key':
-          headers['X-API-Key'] = config.authentication.config.apiKey;
+          // Handle different API key configurations
+          if (config.authentication.config.apiKey) {
+            headers['X-API-Key'] = config.authentication.config.apiKey;
+          } else if (config.authentication.config.value) {
+            // For APIs that expect API key in header
+            headers['X-API-Key'] = config.authentication.config.value;
+          }
           break;
         case 'bearer':
           headers['Authorization'] = `Bearer ${config.authentication.config.token}`;
@@ -546,8 +764,8 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
 }
 
 // Factory function to create tool builder
-export function createDynamicToolBuilder(): DynamicToolBuilder {
-  return new DynamicToolBuilderImpl();
+export function createDynamicToolBuilder(organizationId: string = 'default'): DynamicToolBuilder {
+  return new DynamicToolBuilderImpl(organizationId);
 }
 
 // Schema for tool configuration validation

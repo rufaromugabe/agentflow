@@ -56,7 +56,7 @@ export class AgentFlowAPI {
       const { agentId } = c.req.param();
       const updates = await c.req.json();
 
-      const agent = this.agentBuilder.updateAgent(agentId, updates);
+      const agent = await this.agentBuilder.updateAgent(agentId, updates);
       
       return c.json({
         success: true,
@@ -117,7 +117,7 @@ export class AgentFlowAPI {
         updatedAt: new Date(),
       };
 
-      const tool = this.toolBuilder.createTool(config);
+      const tool = await this.toolBuilder.createTool(config);
       
       return c.json({
         success: true,
@@ -151,7 +151,7 @@ export class AgentFlowAPI {
       const { toolId } = c.req.param();
       const updates = await c.req.json();
 
-      const tool = this.toolBuilder.updateTool(toolId, updates);
+      const tool = await this.toolBuilder.updateTool(toolId, updates);
       
       return c.json({
         success: true,
@@ -179,7 +179,7 @@ export class AgentFlowAPI {
   async deleteTool(c: Context): Promise<Response> {
     try {
       const { toolId } = c.req.param();
-      const deleted = this.toolBuilder.deleteTool(toolId);
+      const deleted = await this.toolBuilder.deleteTool(toolId);
       
       if (!deleted) {
         return c.json({
@@ -223,7 +223,7 @@ export class AgentFlowAPI {
     try {
       const { templateId, customizations } = await c.req.json();
       
-      const tool = this.toolBuilder.createToolFromTemplate(templateId, customizations);
+      const tool = await this.toolBuilder.createToolFromTemplate(templateId, customizations);
       
       return c.json({
         success: true,
