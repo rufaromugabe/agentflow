@@ -1,7 +1,8 @@
 import { Context } from 'hono';
 import { z } from 'zod';
 import { DynamicAgentBuilder, AgentConfig, AgentConfigSchema } from '../agents/dynamic-agent-builder';
-import { DynamicToolBuilder, ToolConfig, ToolConfigSchema } from '../tools/dynamic-tool-builder';
+import { DynamicToolBuilder } from '../tools/dynamic-tool-builder';
+import { ToolConfig, ToolConfigSchema } from '../types';
 
 // Custom API Controllers for AgentFlow Platform
 // Note: This complements Mastra's default routes, doesn't duplicate them
@@ -75,6 +76,63 @@ export class AgentFlowAPI {
         return c.json({
           success: false,
           error: 'Failed to update agent',
+          details: error instanceof Error ? error.message : 'Unknown error',
+        }, 500);
+      }
+    }
+  }
+
+  async patchAgent(c: Context): Promise<Response> {
+    try {
+      const { agentId } = c.req.param();
+      const updates = await c.req.json();
+
+      // Get existing agent configuration
+      const existingAgent = await this.agentBuilder.getAgent(agentId);
+      if (!existingAgent) {
+        return c.json({
+          success: false,
+          error: 'Agent not found',
+        }, 404);
+      }
+
+      // Merge updates with existing configuration
+      const agentConfigs = await this.agentBuilder.listAgents();
+      const existingConfig = agentConfigs.find(config => config.id === agentId);
+      
+      if (!existingConfig) {
+        return c.json({
+          success: false,
+          error: 'Agent configuration not found',
+        }, 404);
+      }
+
+      const updatedConfig = {
+        ...existingConfig,
+        ...updates,
+        updatedAt: new Date(),
+      };
+
+      const agent = await this.agentBuilder.updateAgent(agentId, updatedConfig);
+      
+      return c.json({
+        success: true,
+        data: {
+          id: agentId,
+          updatedAt: new Date(),
+          updatedFields: Object.keys(updates),
+        },
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('not found')) {
+        return c.json({
+          success: false,
+          error: 'Agent not found',
+        }, 404);
+      } else {
+        return c.json({
+          success: false,
+          error: 'Failed to partially update agent',
           details: error instanceof Error ? error.message : 'Unknown error',
         }, 500);
       }
@@ -170,6 +228,63 @@ export class AgentFlowAPI {
         return c.json({
           success: false,
           error: 'Failed to update tool',
+          details: error instanceof Error ? error.message : 'Unknown error',
+        }, 500);
+      }
+    }
+  }
+
+  async patchTool(c: Context): Promise<Response> {
+    try {
+      const { toolId } = c.req.param();
+      const updates = await c.req.json();
+
+      // Get existing tool configuration
+      const existingTool = this.toolBuilder.getTool(toolId);
+      if (!existingTool) {
+        return c.json({
+          success: false,
+          error: 'Tool not found',
+        }, 404);
+      }
+
+      // Merge updates with existing configuration
+      const tools = this.toolBuilder.listTools();
+      const existingConfig = tools.find(tool => tool.id === toolId);
+      
+      if (!existingConfig) {
+        return c.json({
+          success: false,
+          error: 'Tool configuration not found',
+        }, 404);
+      }
+
+      const updatedConfig = {
+        ...existingConfig,
+        ...updates,
+        updatedAt: new Date(),
+      };
+
+      const tool = await this.toolBuilder.updateTool(toolId, updatedConfig);
+      
+      return c.json({
+        success: true,
+        data: {
+          id: toolId,
+          updatedAt: new Date(),
+          updatedFields: Object.keys(updates),
+        },
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('not found')) {
+        return c.json({
+          success: false,
+          error: 'Tool not found',
+        }, 404);
+      } else {
+        return c.json({
+          success: false,
+          error: 'Failed to partially update tool',
           details: error instanceof Error ? error.message : 'Unknown error',
         }, 500);
       }

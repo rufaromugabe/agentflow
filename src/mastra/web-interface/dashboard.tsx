@@ -477,7 +477,9 @@ const CreateToolForm: React.FC<{
     name: '',
     description: '',
     apiEndpoint: '',
-    method: 'GET' as 'GET' | 'POST' | 'PUT' | 'DELETE',
+    method: 'GET' as 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+    contentType: 'application/json' as 'application/json' | 'application/x-www-form-urlencoded' | 'text/plain' | 'text/xml' | 'application/xml',
+    bodyFormat: 'json' as 'json' | 'form' | 'text' | 'xml',
   });
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -538,7 +540,37 @@ const CreateToolForm: React.FC<{
             <option value="GET">GET</option>
             <option value="POST">POST</option>
             <option value="PUT">PUT</option>
+            <option value="PATCH">PATCH</option>
             <option value="DELETE">DELETE</option>
+          </select>
+        </div>
+        
+        <div>
+          <label className="block text-sm font-medium text-gray-700">Content Type</label>
+          <select
+            value={formData.contentType}
+            onChange={(e) => setFormData({ ...formData, contentType: e.target.value as any })}
+            className="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+          >
+            <option value="application/json">application/json</option>
+            <option value="application/x-www-form-urlencoded">application/x-www-form-urlencoded</option>
+            <option value="text/plain">text/plain</option>
+            <option value="text/xml">text/xml</option>
+            <option value="application/xml">application/xml</option>
+          </select>
+        </div>
+        
+        <div>
+          <label className="block text-sm font-medium text-gray-700">Body Format</label>
+          <select
+            value={formData.bodyFormat}
+            onChange={(e) => setFormData({ ...formData, bodyFormat: e.target.value as any })}
+            className="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+          >
+            <option value="json">JSON</option>
+            <option value="form">Form Data</option>
+            <option value="text">Plain Text</option>
+            <option value="xml">XML</option>
           </select>
         </div>
         

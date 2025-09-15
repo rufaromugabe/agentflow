@@ -1,4 +1,5 @@
 // Shared types for the AgentFlow platform
+import { z } from 'zod';
 
 export interface AgentConfig {
   id: string;
@@ -28,8 +29,10 @@ export interface ToolConfig {
   inputSchema: Record<string, any>;
   outputSchema?: Record<string, any>;
   apiEndpoint?: string;
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
   headers?: Record<string, string>;
+  contentType?: 'application/json' | 'application/x-www-form-urlencoded' | 'text/plain' | 'text/xml' | 'application/xml';
+  bodyFormat?: 'json' | 'form' | 'text' | 'xml';
   authentication?: {
     type: 'api_key' | 'bearer' | 'basic' | 'oauth2';
     config: Record<string, any>;
@@ -205,8 +208,10 @@ export interface ToolTable {
   input_schema: string; // JSON
   output_schema?: string; // JSON
   api_endpoint?: string;
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
   headers?: string; // JSON
+  content_type?: string;
+  body_format?: string;
   authentication?: string; // JSON
   rate_limit?: string; // JSON
   timeout?: number;
@@ -338,3 +343,37 @@ export interface ErrorMessage extends WebSocketMessage {
     };
   };
 }
+
+// Zod schemas for validation
+export const ToolConfigSchema = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(100),
+  description: z.string().min(1).max(500),
+  inputSchema: z.record(z.any()),
+  outputSchema: z.record(z.any()).optional(),
+  apiEndpoint: z.string().url().optional(),
+  method: z.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']).optional(),
+  headers: z.record(z.string()).optional(),
+  contentType: z.enum(['application/json', 'application/x-www-form-urlencoded', 'text/plain', 'text/xml', 'application/xml']).optional(),
+  bodyFormat: z.enum(['json', 'form', 'text', 'xml']).optional(),
+  authentication: z.object({
+    type: z.enum(['api_key', 'bearer', 'basic', 'oauth2']),
+    config: z.record(z.any()),
+  }).optional(),
+  rateLimit: z.object({
+    requests: z.number().positive(),
+    window: z.number().positive(),
+  }).optional(),
+  timeout: z.number().positive().optional(),
+  retries: z.number().min(0).optional(),
+  cache: z.object({
+    enabled: z.boolean(),
+    ttl: z.number().positive(),
+  }).optional(),
+  validation: z.object({
+    enabled: z.boolean(),
+    schema: z.record(z.any()).optional(),
+  }).optional(),
+  status: z.enum(['active', 'inactive', 'testing']),
+  metadata: z.record(z.any()).optional(),
+});

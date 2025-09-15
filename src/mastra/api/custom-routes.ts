@@ -151,6 +151,47 @@ export function createCustomRoutes(
     }),
 
     registerApiRoute('/agentflow/agents/:agentId', {
+      method: 'PATCH',
+      handler: (c) => api.patchAgent(c),
+      openapi: {
+        summary: 'Partially update an agent',
+        description: 'Partially update an existing agent with only the provided fields',
+        tags: ['AgentFlow - Agents'],
+        parameters: [
+          {
+            name: 'agentId',
+            in: 'path',
+            required: true,
+            schema: { type: 'string' },
+            description: 'Agent ID to partially update',
+          },
+        ],
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string', description: 'Agent name' },
+                  description: { type: 'string', description: 'Agent description' },
+                  instructions: { type: 'string', description: 'Agent instructions' },
+                  model: { type: 'string', description: 'Model to use' },
+                  tools: { type: 'array', items: { type: 'string' }, description: 'List of tool IDs' },
+                  status: { type: 'string', enum: ['active', 'inactive'], description: 'Agent status' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': { description: 'Agent partially updated successfully' },
+          '404': { description: 'Agent not found' },
+          '500': { description: 'Internal server error' },
+        },
+      },
+    }),
+
+    registerApiRoute('/agentflow/agents/:agentId', {
       method: 'DELETE',
       handler: (c) => api.deleteAgent(c),
       openapi: {
@@ -375,7 +416,9 @@ export function createCustomRoutes(
                   inputSchema: { type: 'object', description: 'Input schema definition' },
                   outputSchema: { type: 'object', description: 'Output schema definition' },
                   apiEndpoint: { type: 'string', description: 'API endpoint URL' },
-                  method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: 'HTTP method' },
+                  method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'], description: 'HTTP method' },
+                  contentType: { type: 'string', enum: ['application/json', 'application/x-www-form-urlencoded', 'text/plain', 'text/xml', 'application/xml'], description: 'Content type for request body' },
+                  bodyFormat: { type: 'string', enum: ['json', 'form', 'text', 'xml'], description: 'Body format for request' },
                   headers: { type: 'object', description: 'Request headers' },
                   authentication: { type: 'object', description: 'Authentication configuration' },
                   rateLimit: { type: 'object', description: 'Rate limiting configuration' },
@@ -447,7 +490,9 @@ export function createCustomRoutes(
                   inputSchema: { type: 'object', description: 'Input schema definition' },
                   outputSchema: { type: 'object', description: 'Output schema definition' },
                   apiEndpoint: { type: 'string', description: 'API endpoint URL' },
-                  method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: 'HTTP method' },
+                  method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'], description: 'HTTP method' },
+                  contentType: { type: 'string', enum: ['application/json', 'application/x-www-form-urlencoded', 'text/plain', 'text/xml', 'application/xml'], description: 'Content type for request body' },
+                  bodyFormat: { type: 'string', enum: ['json', 'form', 'text', 'xml'], description: 'Body format for request' },
                   headers: { type: 'object', description: 'Request headers' },
                   authentication: { type: 'object', description: 'Authentication configuration' },
                   rateLimit: { type: 'object', description: 'Rate limiting configuration' },
@@ -463,6 +508,57 @@ export function createCustomRoutes(
         },
         responses: {
           '200': { description: 'Tool updated successfully' },
+          '404': { description: 'Tool not found' },
+          '500': { description: 'Internal server error' },
+        },
+      },
+    }),
+
+    registerApiRoute('/agentflow/tools/:toolId', {
+      method: 'PATCH',
+      handler: (c) => api.patchTool(c),
+      openapi: {
+        summary: 'Partially update a tool',
+        description: 'Partially update an existing tool with only the provided fields',
+        tags: ['AgentFlow - Tools'],
+        parameters: [
+          {
+            name: 'toolId',
+            in: 'path',
+            required: true,
+            schema: { type: 'string' },
+            description: 'Tool ID to partially update',
+          },
+        ],
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string', description: 'Tool name' },
+                  description: { type: 'string', description: 'Tool description' },
+                  inputSchema: { type: 'object', description: 'Input schema definition' },
+                  outputSchema: { type: 'object', description: 'Output schema definition' },
+                  apiEndpoint: { type: 'string', description: 'API endpoint URL' },
+                  method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'], description: 'HTTP method' },
+                  contentType: { type: 'string', enum: ['application/json', 'application/x-www-form-urlencoded', 'text/plain', 'text/xml', 'application/xml'], description: 'Content type for request body' },
+                  bodyFormat: { type: 'string', enum: ['json', 'form', 'text', 'xml'], description: 'Body format for request' },
+                  headers: { type: 'object', description: 'Request headers' },
+                  authentication: { type: 'object', description: 'Authentication configuration' },
+                  rateLimit: { type: 'object', description: 'Rate limiting configuration' },
+                  timeout: { type: 'number', description: 'Request timeout in milliseconds' },
+                  retries: { type: 'number', description: 'Number of retry attempts' },
+                  cache: { type: 'object', description: 'Caching configuration' },
+                  validation: { type: 'object', description: 'Validation configuration' },
+                  status: { type: 'string', enum: ['active', 'inactive'], description: 'Tool status' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': { description: 'Tool partially updated successfully' },
           '404': { description: 'Tool not found' },
           '500': { description: 'Internal server error' },
         },

@@ -3,39 +3,8 @@ import { RuntimeContext } from '@mastra/core/runtime-context';
 import { z } from 'zod';
 import { postgresManager } from '../database/postgres-manager';
 
-// Types for dynamic tool configuration
-export interface ToolConfig {
-  id: string;
-  name: string;
-  description: string;
-  inputSchema: Record<string, any>;
-  outputSchema?: Record<string, any>;
-  apiEndpoint?: string;
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
-  headers?: Record<string, string>;
-  authentication?: {
-    type: 'api_key' | 'bearer' | 'basic' | 'oauth2';
-    config: Record<string, any>;
-  };
-  rateLimit?: {
-    requests: number;
-    window: number; // in seconds
-  };
-  timeout?: number;
-  retries?: number;
-  cache?: {
-    enabled: boolean;
-    ttl: number; // time to live in seconds
-  };
-  validation?: {
-    enabled: boolean;
-    schema?: Record<string, any>;
-  };
-  createdAt: Date;
-  updatedAt: Date;
-  status: 'active' | 'inactive' | 'testing';
-  metadata?: Record<string, any>;
-}
+// Import ToolConfig and ToolConfigSchema from types
+import { ToolConfig, ToolConfigSchema } from '../types';
 
 export interface ToolTemplate {
   id: string;
@@ -520,7 +489,7 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     const url = this.buildApiUrl(config, context);
     const headers = this.buildHeaders(config);
     
-    // Build request body based on API type
+    // Build request body based on content type and API type
     let body: string | undefined;
     if (config.method !== 'GET') {
       if (config.metadata?.apiType === 'gemini') {
@@ -539,8 +508,8 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
           }
         });
       } else {
-        // Default: send context as JSON
-        body = JSON.stringify(context);
+        // Handle different content types
+        body = this.buildRequestBody(config, context);
       }
     }
 
@@ -613,6 +582,13 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
   private buildHeaders(config: ToolConfig): Record<string, string> {
     const headers = { ...config.headers };
 
+    // Set content type based on configuration
+    if (config.contentType) {
+      headers['Content-Type'] = config.contentType;
+    } else {
+      headers['Content-Type'] = 'application/json';
+    }
+
     // Add authentication headers
     if (config.authentication) {
       switch (config.authentication.type) {
@@ -636,6 +612,72 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     }
 
     return headers;
+  }
+
+  private buildRequestBody(config: ToolConfig, context: any): string {
+    const contentType = config.contentType || 'application/json';
+    const bodyFormat = config.bodyFormat || 'json';
+
+    switch (bodyFormat) {
+      case 'form':
+        return this.buildFormDataBody(context);
+      case 'text':
+        return this.buildTextBody(context);
+      case 'xml':
+        return this.buildXmlBody(context);
+      case 'json':
+      default:
+        return JSON.stringify(context);
+    }
+  }
+
+  private buildFormDataBody(context: any): string {
+    const formData = new URLSearchParams();
+    
+    for (const [key, value] of Object.entries(context)) {
+      if (value !== null && value !== undefined) {
+        formData.append(key, String(value));
+      }
+    }
+    
+    return formData.toString();
+  }
+
+  private buildTextBody(context: any): string {
+    // For text/plain, we'll send the first text field or stringify the context
+    if (typeof context === 'string') {
+      return context;
+    }
+    
+    if (context.text) {
+      return String(context.text);
+    }
+    
+    // Fallback to JSON string for complex objects
+    return JSON.stringify(context);
+  }
+
+  private buildXmlBody(context: any): string {
+    // Simple XML builder - in production, you might want to use a proper XML library
+    let xml = '<?xml version="1.0" encoding="UTF-8"?>\n<root>\n';
+    
+    for (const [key, value] of Object.entries(context)) {
+      if (value !== null && value !== undefined) {
+        xml += `  <${key}>${this.escapeXml(String(value))}</${key}>\n`;
+      }
+    }
+    
+    xml += '</root>';
+    return xml;
+  }
+
+  private escapeXml(text: string): string {
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   private buildInputSchema(schema: Record<string, any>): z.ZodSchema {
@@ -768,34 +810,3 @@ export function createDynamicToolBuilder(organizationId: string = 'default'): Dy
   return new DynamicToolBuilderImpl(organizationId);
 }
 
-// Schema for tool configuration validation
-export const ToolConfigSchema = z.object({
-  id: z.string(),
-  name: z.string().min(1).max(100),
-  description: z.string().min(1).max(500),
-  inputSchema: z.record(z.any()),
-  outputSchema: z.record(z.any()).optional(),
-  apiEndpoint: z.string().url().optional(),
-  method: z.enum(['GET', 'POST', 'PUT', 'DELETE']).optional(),
-  headers: z.record(z.string()).optional(),
-  authentication: z.object({
-    type: z.enum(['api_key', 'bearer', 'basic', 'oauth2']),
-    config: z.record(z.any()),
-  }).optional(),
-  rateLimit: z.object({
-    requests: z.number().positive(),
-    window: z.number().positive(),
-  }).optional(),
-  timeout: z.number().positive().optional(),
-  retries: z.number().min(0).optional(),
-  cache: z.object({
-    enabled: z.boolean(),
-    ttl: z.number().positive(),
-  }).optional(),
-  validation: z.object({
-    enabled: z.boolean(),
-    schema: z.record(z.any()).optional(),
-  }).optional(),
-  status: z.enum(['active', 'inactive', 'testing']),
-  metadata: z.record(z.any()).optional(),
-});

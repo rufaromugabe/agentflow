@@ -8,13 +8,11 @@ export class PostgreSQLManager {
   private schemas: Map<string, DatabaseSchema> = new Map();
 
   constructor() {
-    // Initialize PostgreSQL connection pool
+    // Initialize PostgreSQL connection pool using DATABASE_URL
+    const connectionString = process.env.DATABASE_URL || 'postgresql://user:none@localhost:5432/agentflow';
+    
     this.pool = new Pool({
-      host: process.env.POSTGRES_HOST || 'localhost',
-      port: parseInt(process.env.POSTGRES_PORT || '5432'),
-      database: process.env.POSTGRES_DB || 'agentflow',
-      user: process.env.POSTGRES_USER || 'user',
-      password: process.env.POSTGRES_PASSWORD || 'none',
+      connectionString,
       max: 20, // Maximum number of clients in the pool
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 2000,
@@ -196,8 +194,99 @@ export class PostgreSQLManager {
       )
     `);
 
+    // Create memory-related tables for Mastra memory system
+    await this.createMemoryTables(client, organizationId);
+
     // Create indexes
     await this.createIndexes(client, organizationId);
+  }
+
+  private async createMemoryTables(client: PoolClient, organizationId: string): Promise<void> {
+    // Create threads table for conversation threads
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS "${organizationId}".threads (
+        id VARCHAR(255) PRIMARY KEY,
+        title VARCHAR(500),
+        metadata JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create messages table for storing conversation messages
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS "${organizationId}".messages (
+        id VARCHAR(255) PRIMARY KEY,
+        thread_id VARCHAR(255) NOT NULL,
+        role VARCHAR(20) NOT NULL,
+        content TEXT NOT NULL,
+        metadata JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (thread_id) REFERENCES "${organizationId}".threads(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Create message_embeddings table for vector storage (only if pgvector is available)
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS "${organizationId}".message_embeddings (
+          id VARCHAR(255) PRIMARY KEY,
+          message_id VARCHAR(255) NOT NULL,
+          embedding VECTOR(1536),
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (message_id) REFERENCES "${organizationId}".messages(id) ON DELETE CASCADE
+        )
+      `);
+    } catch (error) {
+      console.warn(`Vector extension not available, creating message_embeddings without vector column: ${error.message}`);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS "${organizationId}".message_embeddings (
+          id VARCHAR(255) PRIMARY KEY,
+          message_id VARCHAR(255) NOT NULL,
+          embedding_text TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (message_id) REFERENCES "${organizationId}".messages(id) ON DELETE CASCADE
+        )
+      `);
+    }
+
+    // Create resources table for resource-scoped memory
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS "${organizationId}".resources (
+        id VARCHAR(255) PRIMARY KEY,
+        type VARCHAR(50) NOT NULL,
+        metadata JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create resource_messages table for linking messages to resources
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS "${organizationId}".resource_messages (
+        id VARCHAR(255) PRIMARY KEY,
+        resource_id VARCHAR(255) NOT NULL,
+        message_id VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (resource_id) REFERENCES "${organizationId}".resources(id) ON DELETE CASCADE,
+        FOREIGN KEY (message_id) REFERENCES "${organizationId}".messages(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Create working_memory table for temporary memory storage
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS "${organizationId}".working_memory (
+        id VARCHAR(255) PRIMARY KEY,
+        thread_id VARCHAR(255),
+        resource_id VARCHAR(255),
+        key VARCHAR(255) NOT NULL,
+        value JSONB NOT NULL,
+        expires_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (thread_id) REFERENCES "${organizationId}".threads(id) ON DELETE CASCADE,
+        FOREIGN KEY (resource_id) REFERENCES "${organizationId}".resources(id) ON DELETE CASCADE
+      )
+    `);
   }
 
   private async createIndexes(client: PoolClient, organizationId: string): Promise<void> {
@@ -232,6 +321,28 @@ export class PostgreSQLManager {
       `CREATE INDEX IF NOT EXISTS idx_analytics_organization_id ON "${organizationId}".analytics (organization_id)`,
       `CREATE INDEX IF NOT EXISTS idx_analytics_metric_type ON "${organizationId}".analytics (metric_type)`,
       `CREATE INDEX IF NOT EXISTS idx_analytics_timestamp ON "${organizationId}".analytics (timestamp)`,
+      
+      // Memory table indexes
+      `CREATE INDEX IF NOT EXISTS idx_threads_created_at ON "${organizationId}".threads (created_at)`,
+      `CREATE INDEX IF NOT EXISTS idx_threads_updated_at ON "${organizationId}".threads (updated_at)`,
+      
+      `CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON "${organizationId}".messages (thread_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_messages_role ON "${organizationId}".messages (role)`,
+      `CREATE INDEX IF NOT EXISTS idx_messages_created_at ON "${organizationId}".messages (created_at)`,
+      
+      `CREATE INDEX IF NOT EXISTS idx_message_embeddings_message_id ON "${organizationId}".message_embeddings (message_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_message_embeddings_created_at ON "${organizationId}".message_embeddings (created_at)`,
+      
+      `CREATE INDEX IF NOT EXISTS idx_resources_type ON "${organizationId}".resources (type)`,
+      `CREATE INDEX IF NOT EXISTS idx_resources_created_at ON "${organizationId}".resources (created_at)`,
+      
+      `CREATE INDEX IF NOT EXISTS idx_resource_messages_resource_id ON "${organizationId}".resource_messages (resource_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_resource_messages_message_id ON "${organizationId}".resource_messages (message_id)`,
+      
+      `CREATE INDEX IF NOT EXISTS idx_working_memory_thread_id ON "${organizationId}".working_memory (thread_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_working_memory_resource_id ON "${organizationId}".working_memory (resource_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_working_memory_key ON "${organizationId}".working_memory (key)`,
+      `CREATE INDEX IF NOT EXISTS idx_working_memory_expires_at ON "${organizationId}".working_memory (expires_at)`,
     ];
 
     for (const indexQuery of indexes) {

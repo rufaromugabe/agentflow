@@ -3,6 +3,7 @@ import { RuntimeContext } from '@mastra/core/runtime-context';
 import { openai } from '@ai-sdk/openai';
 import { z } from 'zod';
 import { postgresManager } from '../database/postgres-manager';
+import { createDynamicToolBuilder } from '../tools/dynamic-tool-builder';
 
 // Types for dynamic agent configuration
 export interface AgentConfig {
@@ -50,11 +51,42 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
   private agents: Map<string, Agent> = new Map();
   private configs: Map<string, AgentConfig> = new Map();
   private toolRegistry: Map<string, any> = new Map();
+  private toolBuilder: any;
   private organizationId: string = 'default';
 
   constructor(organizationId: string = 'default') {
     this.organizationId = organizationId;
     this.initializeDefaultTools();
+  }
+
+  async initialize(): Promise<void> {
+    try {
+      // Initialize the database schema for this organization
+      await postgresManager.initializeOrganization(this.organizationId);
+      
+      // Initialize the tool builder and load tools from database
+      this.toolBuilder = createDynamicToolBuilder(this.organizationId);
+      await this.toolBuilder.initialize();
+      
+      // Load tools from the tool builder into our registry
+      const tools = this.toolBuilder.listTools();
+      for (const toolConfig of tools) {
+        const tool = this.toolBuilder.getTool(toolConfig.id);
+        if (tool) {
+          this.toolRegistry.set(toolConfig.id, tool);
+        }
+      }
+      
+      // Initialize the memory system for this organization
+      const { initializeOrganizationMemory } = require('../memory/organization-memory');
+      await initializeOrganizationMemory(this.organizationId);
+      
+      console.log(`Dynamic agent builder initialized for organization: ${this.organizationId}`);
+      console.log(`Loaded ${this.toolRegistry.size} tools from database`);
+    } catch (error) {
+      console.error(`Failed to initialize dynamic agent builder for ${this.organizationId}:`, error);
+      throw error;
+    }
   }
 
   private initializeDefaultTools() {
@@ -95,7 +127,7 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
         const agentCtx = ctx.get('agentContext') as AgentRuntimeContext;
         return this.selectTools(config, agentCtx);
       },
-      memory: config.memory?.enabled ? this.createMemory(config) : undefined,
+      memory: config.memory?.enabled ? await this.createMemory(config) : undefined,
       voice: config.voice?.enabled ? this.createVoice(config) : undefined,
     });
     
@@ -313,10 +345,35 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
     return toolTiers[tier]?.includes(toolId) || false;
   }
 
-  private createMemory(config: AgentConfig) {
+  private async createMemory(config: AgentConfig) {
     // Create memory configuration based on agent settings
-    // This would integrate with your memory system
-    return undefined; // Placeholder
+    if (!config.memory?.enabled) {
+      return undefined;
+    }
+
+    // Import the organization memory implementation
+    const { getMemoryManager } = require('../memory/organization-memory');
+    
+    // Get the memory manager for this organization
+    const memoryManager = getMemoryManager(this.organizationId);
+    
+    // Get or create memory for this specific agent
+    const memory = await memoryManager.getAgentMemory(
+      config.id,
+      config.name,
+      {
+        lastMessages: 15,
+        semanticRecall: {
+          topK: 3,
+          messageRange: 2
+        }, // Enabled by default when pgvector is available
+        workingMemory: true,
+        scope: 'resource', // Default to resource-scoped memory
+        generateTitle: true
+      }
+    );
+
+    return memory;
   }
 
   private createVoice(config: AgentConfig) {
@@ -328,6 +385,29 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
   // Method to register tools dynamically
   registerTool(toolId: string, tool: any) {
     this.toolRegistry.set(toolId, tool);
+    // Also register with the tool builder if it exists
+    if (this.toolBuilder) {
+      // This would create/update the tool in the database
+      // For now, just ensure it's in our registry
+    }
+  }
+
+  // Method to refresh tools from database
+  async refreshTools(): Promise<void> {
+    if (this.toolBuilder) {
+      // Reload tools from database
+      const tools = this.toolBuilder.listTools();
+      this.toolRegistry.clear();
+      
+      for (const toolConfig of tools) {
+        const tool = this.toolBuilder.getTool(toolConfig.id);
+        if (tool) {
+          this.toolRegistry.set(toolConfig.id, tool);
+        }
+      }
+      
+      console.log(`Refreshed ${this.toolRegistry.size} tools from database`);
+    }
   }
 
   // Method to get agent with runtime context
