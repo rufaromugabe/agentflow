@@ -1,7 +1,7 @@
 // Main entry point for the AgentFlow platform
 import { Mastra } from '@mastra/core/mastra';
 import { getAgentBuilder, getToolBuilder, setupAgentFlow } from './platform';
-import { createCustomRoutes } from './api/custom-routes';
+import { createAgentFlowRoutes } from './api/agentflow-routes';
 import { logger } from './utils/logger';
 
 // Function to load dynamic agents from database
@@ -37,16 +37,16 @@ await setupAgentFlow(undefined, organizationId);
 // Initialize dynamic agents
 const dynamicAgents = await loadDynamicAgents(organizationId);
 
-// Create custom routes
+// Create consolidated AgentFlow routes
 const agentBuilder = getAgentBuilder(organizationId);
 const toolBuilder = getToolBuilder(organizationId);
-const customRoutes = createCustomRoutes(agentBuilder, toolBuilder);
+const agentFlowRoutes = createAgentFlowRoutes(agentBuilder, toolBuilder);
 
-// Create the main Mastra instance with dynamic agents and custom routes
+// Create the main Mastra instance with dynamic agents and consolidated routes
 export const mastra = new Mastra({
   agents: dynamicAgents,
   server: {
-    apiRoutes: customRoutes,
+    apiRoutes: agentFlowRoutes,
     build: {
       openAPIDocs: true,
       swaggerUI: true,

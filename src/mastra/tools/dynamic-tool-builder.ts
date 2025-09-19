@@ -5,6 +5,7 @@ import { postgresManager } from '../database/postgres-manager';
 import { logger } from '../utils/logger';
 import { AgentFlowError, safeJsonParse, safeJsonStringify, validateOrganizationId } from '../utils/helpers';
 import { cacheManager, cacheKey, invalidateToolCache } from '../utils/cache';
+import { errorHandler, withErrorHandling, createErrorContext } from '../utils/error-handler';
 
 // Import ToolConfig and ToolConfigSchema from types
 import { ToolConfig, ToolConfigSchema } from '../types';
@@ -30,6 +31,20 @@ export interface DynamicToolBuilder {
   createTemplate(template: ToolTemplate): ToolTemplate;
   getTemplates(): ToolTemplate[];
   validateToolConfig(config: ToolConfig): { valid: boolean; errors: string[] };
+  healthCheck(toolId: string): Promise<{
+    healthy: boolean;
+    status: string;
+    responseTime?: number;
+    error?: string;
+    lastChecked: string;
+  }>;
+  healthCheckAll(): Promise<Record<string, {
+    healthy: boolean;
+    status: string;
+    responseTime?: number;
+    error?: string;
+    lastChecked: string;
+  }>>;
 }
 
 // Dynamic Tool Builder Implementation
@@ -120,6 +135,50 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       tags: ['http', 'api', 'rest'],
     };
 
+    // Gemini API Template
+    const geminiTemplate: ToolTemplate = {
+      id: 'gemini-api',
+      name: 'Gemini API Tool',
+      description: 'Tool for making calls to Google Gemini API',
+      category: 'ai',
+      template: {
+        name: 'Gemini API Tool',
+        description: 'Make calls to Google Gemini API',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            text: {
+              type: 'string',
+              description: 'Text to send to Gemini API',
+            },
+          },
+          required: ['text'],
+        },
+        apiEndpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent',
+        method: 'POST',
+        contentType: 'application/json',
+        authentication: {
+          type: 'api_key',
+          config: {
+            name: 'key',
+            in: 'query', // Gemini expects API key as query parameter
+            value: 'YOUR_GEMINI_API_KEY',
+          },
+        },
+        metadata: {
+          apiType: 'gemini',
+        },
+        timeout: 30000,
+        retries: 3,
+        cache: {
+          enabled: true,
+          ttl: 300, // 5 minutes
+        },
+      },
+      examples: [],
+      tags: ['gemini', 'google', 'ai', 'llm'],
+    };
+
     // Weather API Template
     const weatherTemplate: ToolTemplate = {
       id: 'weather-api',
@@ -188,6 +247,7 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     };
 
     this.templates.set(httpApiTemplate.id, httpApiTemplate);
+    this.templates.set(geminiTemplate.id, geminiTemplate);
     this.templates.set(weatherTemplate.id, weatherTemplate);
     this.templates.set(databaseTemplate.id, databaseTemplate);
   }
@@ -343,8 +403,17 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
 
       await postgresManager.updateTool(this.organizationId, toolId, dbUpdates);
 
-      // Recreate tool with updated configuration
-      const updatedTool = await this.createTool(updatedConfig);
+      // Recreate tool instance with updated configuration (without calling createTool to avoid duplicate key error)
+      const updatedTool = createTool({
+        id: updatedConfig.id,
+        description: updatedConfig.description,
+        inputSchema: this.buildInputSchema(updatedConfig.inputSchema),
+        outputSchema: updatedConfig.outputSchema ? this.buildOutputSchema(updatedConfig.outputSchema) : undefined,
+        execute: async ({ context, runtimeContext }, options) => {
+          return await this.executeTool(updatedConfig, context, runtimeContext, options?.abortSignal);
+        },
+      });
+      
       this.tools.set(toolId, updatedTool);
       this.configs.set(toolId, updatedConfig);
 
@@ -440,10 +509,126 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       errors.push('Retries must be non-negative');
     }
 
+    // Validate authentication configuration
+    if (config.authentication) {
+      try {
+        this.validateAuthentication(config.authentication);
+      } catch (error) {
+        errors.push(`Authentication validation failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
+
     return {
       valid: errors.length === 0,
       errors,
     };
+  }
+
+  async healthCheck(toolId: string): Promise<{
+    healthy: boolean;
+    status: string;
+    responseTime?: number;
+    error?: string;
+    lastChecked: string;
+  }> {
+    const config = this.configs.get(toolId);
+    if (!config) {
+      return {
+        healthy: false,
+        status: 'not_found',
+        error: `Tool with ID '${toolId}' not found`,
+        lastChecked: new Date().toISOString(),
+      };
+    }
+
+    if (!config.apiEndpoint) {
+      return {
+        healthy: true,
+        status: 'no_api_endpoint',
+        lastChecked: new Date().toISOString(),
+      };
+    }
+
+    try {
+      const startTime = Date.now();
+      
+      // Create a simple health check request
+      const healthCheckConfig = {
+        ...config,
+        method: 'GET' as const,
+        timeout: 5000, // 5 second timeout for health checks
+        retries: 1, // Only 1 retry for health checks
+      };
+
+      // Try to make a minimal request to check if the API is reachable
+      const url = this.buildApiUrl(healthCheckConfig, {});
+      const headers = this.buildHeaders(healthCheckConfig);
+      
+      const response = await fetch(url, {
+        method: 'GET',
+        headers,
+        signal: AbortSignal.timeout(5000),
+      });
+
+      const responseTime = Date.now() - startTime;
+
+      if (response.ok) {
+        return {
+          healthy: true,
+          status: 'healthy',
+          responseTime,
+          lastChecked: new Date().toISOString(),
+        };
+      } else {
+        return {
+          healthy: false,
+          status: 'unhealthy',
+          responseTime,
+          error: `HTTP ${response.status}: ${response.statusText}`,
+          lastChecked: new Date().toISOString(),
+        };
+      }
+    } catch (error) {
+      return {
+        healthy: false,
+        status: 'error',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        lastChecked: new Date().toISOString(),
+      };
+    }
+  }
+
+  async healthCheckAll(): Promise<Record<string, {
+    healthy: boolean;
+    status: string;
+    responseTime?: number;
+    error?: string;
+    lastChecked: string;
+  }>> {
+    const results: Record<string, any> = {};
+    const toolIds = Array.from(this.configs.keys());
+
+    // Run health checks in parallel with a limit to avoid overwhelming APIs
+    const batchSize = 5;
+    for (let i = 0; i < toolIds.length; i += batchSize) {
+      const batch = toolIds.slice(i, i + batchSize);
+      const batchPromises = batch.map(async (toolId) => {
+        const result = await this.healthCheck(toolId);
+        return { toolId, result };
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      batchResults.forEach(({ toolId, result }) => {
+        results[toolId] = result;
+      });
+
+      // Small delay between batches to be respectful to APIs
+      if (i + batchSize < toolIds.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+
+    return results;
   }
 
   private async executeTool(
@@ -452,42 +637,65 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     runtimeContext: RuntimeContext,
     abortSignal?: AbortSignal
   ): Promise<any> {
-    try {
-      // Check cache first
-      if (config.cache?.enabled) {
-        const cacheKey = this.generateCacheKey(config, context);
-        const cached = this.getFromCache(cacheKey);
-        if (cached) {
-          return cached;
+    const errorContext = createErrorContext(
+      config.id,
+      undefined,
+      this.organizationId,
+      { operation: 'tool_execution', hasApiEndpoint: !!config.apiEndpoint }
+    );
+
+    return await withErrorHandling(
+      async () => {
+        // Check cache first
+        if (config.cache?.enabled) {
+          const cacheKey = this.generateCacheKey(config, context);
+          const cached = this.getFromCache(cacheKey);
+          if (cached) {
+            logger.debug('Tool result served from cache', {
+              toolId: config.id,
+              organizationId: this.organizationId,
+            });
+            return cached;
+          }
         }
+
+        // Validate input if validation is enabled
+        if (config.validation?.enabled) {
+          this.validateInput(context, config.inputSchema);
+        }
+
+        let result: any;
+
+        if (config.apiEndpoint) {
+          // Execute API call with enhanced error handling
+          result = await this.executeApiCall(config, context, abortSignal);
+        } else {
+          // Execute custom logic (placeholder for now)
+          result = await this.executeCustomLogic(config, context, runtimeContext);
+        }
+
+        // Cache result if caching is enabled
+        if (config.cache?.enabled) {
+          const cacheKey = this.generateCacheKey(config, context);
+          this.setCache(cacheKey, result, config.cache.ttl);
+        }
+
+        logger.info('Tool executed successfully', {
+          toolId: config.id,
+          organizationId: this.organizationId,
+          hasResult: !!result,
+        });
+
+        return result;
+      },
+      errorContext,
+      {
+        maxRetries: config.retries || 3,
+        retryDelay: 1000,
+        exponentialBackoff: true,
+        retryableErrors: ['network', 'timeout', 'server', 'rate_limit'],
       }
-
-      // Validate input if validation is enabled
-      if (config.validation?.enabled) {
-        this.validateInput(context, config.inputSchema);
-      }
-
-      let result: any;
-
-      if (config.apiEndpoint) {
-        // Execute API call
-        result = await this.executeApiCall(config, context, abortSignal);
-      } else {
-        // Execute custom logic (placeholder for now)
-        result = await this.executeCustomLogic(config, context, runtimeContext);
-      }
-
-      // Cache result if caching is enabled
-      if (config.cache?.enabled) {
-        const cacheKey = this.generateCacheKey(config, context);
-        this.setCache(cacheKey, result, config.cache.ttl);
-      }
-
-      return result;
-    } catch (error) {
-      console.error(`Tool execution error for ${config.id}:`, error);
-      throw error;
-    }
+    );
   }
 
   private async executeApiCall(
@@ -498,49 +706,230 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     const url = this.buildApiUrl(config, context);
     const headers = this.buildHeaders(config);
     
-    // Build request body based on content type and API type
-    let body: string | undefined;
+    // Build request body based on content type
+    let body: string | undefined = undefined;
     if (config.method !== 'GET') {
-      if (config.metadata?.apiType === 'gemini') {
-        // Special handling for Gemini API
-        body = JSON.stringify({
-          contents: [{
-            parts: [{
-              text: context.text
-            }]
-          }],
-          generationConfig: {
-            temperature: 0.7,
-            topK: 40,
-            topP: 0.95,
-            maxOutputTokens: 1024,
-          }
-        });
-      } else {
-        // Handle different content types
-        body = this.buildRequestBody(config, context);
-      }
+      body = this.buildRequestBody(config, context);
     }
 
-    console.log(`Making API call to: ${url}`);
-    console.log(`Headers:`, headers);
-    console.log(`Body:`, body);
-
-    const response = await fetch(url, {
+    // Log request details (without sensitive information)
+    const sanitizedHeaders = this.sanitizeHeaders(headers);
+    logger.info(`Making API call to: ${url}`, {
+      toolId: config.id,
       method: config.method,
+      headers: sanitizedHeaders,
+      hasBody: !!body,
+      organizationId: this.organizationId
+    });
+
+    // Use retry mechanism for API calls
+    return await this.retryApiCall(
+      () => this.makeHttpRequest(url, headers, body, config.method || 'GET', abortSignal),
+      config.retries || 3,
+      config.timeout || 30000,
+      config.id
+    );
+  }
+
+  private async makeHttpRequest(
+    url: string,
+    headers: Record<string, string>,
+    body: string | undefined,
+    method: string,
+    abortSignal?: AbortSignal
+  ): Promise<any> {
+    const response = await fetch(url, {
+      method,
       headers,
       body,
       signal: abortSignal,
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`API call failed: ${response.status} ${response.statusText}`);
-      console.error(`Response body:`, errorText);
-      throw new Error(`API call failed: ${response.status} ${response.statusText}`);
+      let errorText = '';
+      try {
+        errorText = await response.text();
+      } catch (e) {
+        errorText = 'Failed to read error response';
+      }
+      
+      const errorDetails = this.parseErrorResponse(errorText, response.status);
+      
+      logger.error(`API call failed: ${response.status} ${response.statusText}`, {
+        status: response.status,
+        statusText: response.statusText,
+        errorDetails,
+        url: this.sanitizeUrl(url)
+      });
+
+      throw this.createApiError(response.status, response.statusText, errorDetails, url);
     }
 
-    return await response.json();
+    // Handle different response types
+    const contentType = response.headers.get('content-type') || '';
+    
+    if (contentType.includes('application/json')) {
+      try {
+        return await response.json();
+      } catch (e) {
+        logger.warn('Failed to parse JSON response, returning text', {
+          url: this.sanitizeUrl(url),
+          error: e instanceof Error ? e.message : 'Unknown error'
+        });
+        return await response.text();
+      }
+    } else if (contentType.includes('text/')) {
+      return await response.text();
+    } else {
+      // For binary or unknown content types, return the response object
+      return {
+        status: response.status,
+        statusText: response.statusText,
+        headers: Object.fromEntries(response.headers.entries()),
+        body: await response.text()
+      };
+    }
+  }
+
+  private async retryApiCall<T>(
+    operation: () => Promise<T>,
+    maxRetries: number,
+    timeout: number,
+    toolId: string
+  ): Promise<T> {
+    let lastError: Error;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        // Add timeout to the operation
+        return await Promise.race([
+          operation(),
+          new Promise<never>((_, reject) => 
+            setTimeout(() => reject(new Error(`Request timeout after ${timeout}ms`)), timeout)
+          )
+        ]);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error('Unknown error');
+        
+        // Don't retry certain types of errors
+        if (this.isNonRetryableError(lastError)) {
+          logger.error(`Non-retryable error encountered`, {
+            toolId,
+            error: lastError.message,
+            attempt
+          });
+          throw lastError;
+        }
+        
+        if (attempt === maxRetries) {
+          logger.error(`API call failed after ${maxRetries} attempts`, {
+            toolId,
+            attempts: maxRetries,
+            finalError: lastError.message,
+            organizationId: this.organizationId
+          });
+          throw lastError;
+        }
+        
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000); // Exponential backoff, max 10s
+        logger.warn(`API call failed, retrying in ${delay}ms`, {
+          toolId,
+          attempt,
+          maxRetries,
+          error: lastError.message,
+          nextRetryIn: delay
+        });
+        
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+    
+    throw lastError!;
+  }
+
+  private isNonRetryableError(error: Error): boolean {
+    const message = error.message.toLowerCase();
+    
+    // Don't retry authentication/authorization errors
+    if (message.includes('401') || message.includes('unauthorized')) return true;
+    if (message.includes('403') || message.includes('forbidden')) return true;
+    if (message.includes('404') || message.includes('not found')) return true;
+    
+    // Don't retry client errors (4xx)
+    if (message.includes('400') || message.includes('bad request')) return true;
+    if (message.includes('422') || message.includes('unprocessable entity')) return true;
+    
+    // Don't retry timeout errors (they're already handled by the timeout mechanism)
+    if (message.includes('timeout')) return true;
+    
+    return false;
+  }
+
+  private createApiError(status: number, statusText: string, errorDetails: any, url: string): Error {
+    const sanitizedUrl = this.sanitizeUrl(url);
+    
+    switch (status) {
+      case 400:
+        return new Error(`Bad Request (400): Invalid request parameters. URL: ${sanitizedUrl}. Details: ${JSON.stringify(errorDetails)}`);
+      case 401:
+        return new Error(`Unauthorized (401): Invalid or missing API key. Please check your authentication configuration. URL: ${sanitizedUrl}`);
+      case 403:
+        return new Error(`Forbidden (403): API key doesn't have permission to access this resource or the API key is invalid. URL: ${sanitizedUrl}. Details: ${JSON.stringify(errorDetails)}`);
+      case 404:
+        return new Error(`Not Found (404): The requested resource was not found. URL: ${sanitizedUrl}`);
+      case 429:
+        return new Error(`Rate Limited (429): Too many requests. Please implement rate limiting or wait before retrying. URL: ${sanitizedUrl}`);
+      case 500:
+        return new Error(`Internal Server Error (500): The API server encountered an error. URL: ${sanitizedUrl}. Details: ${JSON.stringify(errorDetails)}`);
+      case 502:
+        return new Error(`Bad Gateway (502): The API server is temporarily unavailable. URL: ${sanitizedUrl}`);
+      case 503:
+        return new Error(`Service Unavailable (503): The API service is temporarily down. URL: ${sanitizedUrl}`);
+      default:
+        return new Error(`API call failed (${status} ${statusText}): URL: ${sanitizedUrl}. Details: ${JSON.stringify(errorDetails)}`);
+    }
+  }
+
+  private parseErrorResponse(errorText: string, status: number): any {
+    try {
+      return JSON.parse(errorText);
+    } catch {
+      return { message: errorText, status };
+    }
+  }
+
+  private sanitizeHeaders(headers: Record<string, string>): Record<string, string> {
+    const sanitized = { ...headers };
+    
+    // Remove or mask sensitive headers
+    const sensitiveHeaders = ['authorization', 'x-api-key', 'api-key', 'cookie'];
+    for (const header of sensitiveHeaders) {
+      if (sanitized[header]) {
+        sanitized[header] = '***REDACTED***';
+      }
+    }
+    
+    return sanitized;
+  }
+
+  private sanitizeUrl(url: string): string {
+    try {
+      const urlObj = new URL(url);
+      // Remove API keys from query parameters
+      const params = new URLSearchParams(urlObj.search);
+      const sensitiveParams = ['key', 'api_key', 'apikey', 'token', 'access_token', 'auth', 'authorization'];
+      
+      for (const param of sensitiveParams) {
+        if (params.has(param)) {
+          params.set(param, '***REDACTED***');
+        }
+      }
+      
+      urlObj.search = params.toString();
+      return urlObj.toString();
+    } catch {
+      return url; // Return original if URL parsing fails
+    }
   }
 
   private async executeCustomLogic(
@@ -561,7 +950,10 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     
     // Replace URL parameters with context values
     Object.keys(context).forEach(key => {
-      url = url.replace(`{${key}}`, encodeURIComponent(context[key]));
+      const value = context[key];
+      if (value !== null && value !== undefined) {
+        url = url.replace(`{${key}}`, encodeURIComponent(String(value)));
+      }
     });
 
     // Add query parameters for GET requests or when API key should be in query
@@ -569,14 +961,26 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
     
     // Add API key as query parameter if configured that way
     if (config.authentication?.type === 'api_key' && config.authentication.config.in === 'query') {
-      params.append(config.authentication.config.name || 'key', config.authentication.config.value);
+      const apiKey = config.authentication.config.value || config.authentication.config.apiKey;
+      const paramName = config.authentication.config.name || 'key';
+      params.append(paramName, apiKey);
     }
     
     // Add context parameters for GET requests
     if (config.method === 'GET') {
       Object.keys(context).forEach(key => {
-        if (typeof context[key] === 'string' || typeof context[key] === 'number') {
-          params.append(key, context[key].toString());
+        const value = context[key];
+        if (value !== null && value !== undefined) {
+          if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+            params.append(key, String(value));
+          } else if (Array.isArray(value)) {
+            // Handle arrays by joining with commas or adding multiple parameters
+            value.forEach(item => {
+              if (item !== null && item !== undefined) {
+                params.append(key, String(item));
+              }
+            });
+          }
         }
       });
     }
@@ -598,57 +1002,323 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       headers['Content-Type'] = 'application/json';
     }
 
-    // Add authentication headers
+    // Add authentication headers with validation
     if (config.authentication) {
+      this.validateAuthentication(config.authentication);
+      
       switch (config.authentication.type) {
         case 'api_key':
-          // Handle different API key configurations
-          if (config.authentication.config.apiKey) {
-            headers['X-API-Key'] = config.authentication.config.apiKey;
-          } else if (config.authentication.config.value) {
-            // For APIs that expect API key in header
-            headers['X-API-Key'] = config.authentication.config.value;
-          }
+          this.addApiKeyAuthentication(headers, config.authentication.config);
           break;
         case 'bearer':
-          headers['Authorization'] = `Bearer ${config.authentication.config.token}`;
+          this.addBearerAuthentication(headers, config.authentication.config);
           break;
         case 'basic':
-          const credentials = btoa(`${config.authentication.config.username}:${config.authentication.config.password}`);
-          headers['Authorization'] = `Basic ${credentials}`;
+          this.addBasicAuthentication(headers, config.authentication.config);
           break;
+        default:
+          throw new Error(`Unsupported authentication type: ${config.authentication.type}`);
       }
     }
 
     return headers;
   }
 
+  private validateAuthentication(auth: any): void {
+    if (!auth.type) {
+      throw new Error('Authentication type is required');
+    }
+
+    if (!auth.config) {
+      throw new Error('Authentication configuration is required');
+    }
+
+    switch (auth.type) {
+      case 'api_key':
+        this.validateApiKeyConfig(auth.config);
+        break;
+      case 'bearer':
+        this.validateBearerConfig(auth.config);
+        break;
+      case 'basic':
+        this.validateBasicConfig(auth.config);
+        break;
+      default:
+        throw new Error(`Unsupported authentication type: ${auth.type}`);
+    }
+  }
+
+  private validateApiKeyConfig(config: any): void {
+    if (!config.value && !config.apiKey) {
+      throw new Error('API key value is required for api_key authentication');
+    }
+
+    const apiKey = config.value || config.apiKey;
+    if (!this.isValidApiKey(apiKey)) {
+      throw new Error('Invalid API key format. API keys should be non-empty strings.');
+    }
+  }
+
+  private validateBearerConfig(config: any): void {
+    if (!config.token) {
+      throw new Error('Token is required for bearer authentication');
+    }
+
+    if (typeof config.token !== 'string' || config.token.trim() === '') {
+      throw new Error('Invalid bearer token format. Token should be a non-empty string.');
+    }
+  }
+
+  private validateBasicConfig(config: any): void {
+    if (!config.username || !config.password) {
+      throw new Error('Username and password are required for basic authentication');
+    }
+
+    if (typeof config.username !== 'string' || config.username.trim() === '') {
+      throw new Error('Invalid username format. Username should be a non-empty string.');
+    }
+
+    if (typeof config.password !== 'string') {
+      throw new Error('Invalid password format. Password should be a string.');
+    }
+  }
+
+  private isValidApiKey(apiKey: string): boolean {
+    if (!apiKey || typeof apiKey !== 'string') {
+      return false;
+    }
+
+    const trimmed = apiKey.trim();
+    if (trimmed.length === 0) {
+      return false;
+    }
+
+    // Basic validation - API keys should be at least 10 characters
+    if (trimmed.length < 10) {
+      logger.warn('API key seems too short. Most API keys are longer than 10 characters.', {
+        keyLength: trimmed.length,
+        organizationId: this.organizationId
+      });
+    }
+
+    return true;
+  }
+
+  private addApiKeyAuthentication(headers: Record<string, string>, config: any): void {
+    const apiKey = config.value || config.apiKey;
+    const headerName = config.name || 'X-API-Key';
+    
+    // Validate API key before adding to headers
+    if (!this.isValidApiKey(apiKey)) {
+      throw new Error('Invalid API key provided');
+    }
+
+    // Only add to headers if not configured to be in query parameters
+    if (config.in !== 'query') {
+      headers[headerName] = apiKey;
+      
+      logger.debug('API key authentication added to headers', {
+        headerName,
+        keyLength: apiKey.length,
+        organizationId: this.organizationId
+      });
+    } else {
+      logger.debug('API key authentication configured for query parameters', {
+        paramName: config.name || 'key',
+        keyLength: apiKey.length,
+        organizationId: this.organizationId
+      });
+    }
+  }
+
+  private addBearerAuthentication(headers: Record<string, string>, config: any): void {
+    const token = config.token;
+    
+    if (!token || typeof token !== 'string' || token.trim() === '') {
+      throw new Error('Invalid bearer token provided');
+    }
+
+    headers['Authorization'] = `Bearer ${token}`;
+    
+    logger.debug('Bearer authentication added', {
+      tokenLength: token.length,
+      organizationId: this.organizationId
+    });
+  }
+
+  private addBasicAuthentication(headers: Record<string, string>, config: any): void {
+    const username = config.username;
+    const password = config.password;
+    
+    if (!username || !password) {
+      throw new Error('Username and password are required for basic authentication');
+    }
+
+    const credentials = btoa(`${username}:${password}`);
+    headers['Authorization'] = `Basic ${credentials}`;
+    
+    logger.debug('Basic authentication added', {
+      username,
+      organizationId: this.organizationId
+    });
+  }
+
+  private applyBodyTransform(context: any, transform: any): any {
+    try {
+      // Handle different transform types
+      if (typeof transform === 'function') {
+        return transform(context);
+      }
+      
+      if (typeof transform === 'object' && transform !== null) {
+        // Handle template-based transformation
+        if (transform.template) {
+          return this.applyTemplateTransform(context, transform.template);
+        }
+        
+        // Handle field mapping
+        if (transform.fieldMapping) {
+          return this.applyFieldMapping(context, transform.fieldMapping);
+        }
+        
+        // Handle nested structure creation
+        if (transform.structure) {
+          return this.applyStructureTransform(context, transform.structure);
+        }
+      }
+      
+      return context;
+    } catch (error) {
+      logger.warn('Failed to apply body transform, using original context', {
+        error: error instanceof Error ? error.message : 'Unknown error'
+      });
+      return context;
+    }
+  }
+
+  private applyTemplateTransform(context: any, template: string): any {
+    // Simple template replacement using {{field}} syntax
+    let result = template;
+    Object.keys(context).forEach(key => {
+      const value = context[key];
+      if (value !== null && value !== undefined) {
+        result = result.replace(new RegExp(`{{${key}}}`, 'g'), String(value));
+      }
+    });
+    
+    try {
+      return JSON.parse(result);
+    } catch {
+      return result;
+    }
+  }
+
+  private applyFieldMapping(context: any, fieldMapping: Record<string, string>): any {
+    const result: any = {};
+    Object.entries(fieldMapping).forEach(([sourceField, targetField]) => {
+      if (context[sourceField] !== undefined) {
+        result[targetField] = context[sourceField];
+      }
+    });
+    return result;
+  }
+
+  private applyStructureTransform(context: any, structure: any): any {
+    // Apply nested structure transformation
+    const result = JSON.parse(JSON.stringify(structure));
+    
+    const replacePlaceholders = (obj: any): any => {
+      if (typeof obj === 'string') {
+        // Replace {{field}} placeholders
+        return obj.replace(/\{\{(\w+)\}\}/g, (match, field) => {
+          return context[field] !== undefined ? String(context[field]) : match;
+        });
+      } else if (Array.isArray(obj)) {
+        return obj.map(replacePlaceholders);
+      } else if (typeof obj === 'object' && obj !== null) {
+        const newObj: any = {};
+        Object.keys(obj).forEach(key => {
+          newObj[key] = replacePlaceholders(obj[key]);
+        });
+        return newObj;
+      }
+      return obj;
+    };
+    
+    return replacePlaceholders(result);
+  }
+
   private buildRequestBody(config: ToolConfig, context: any): string {
     const contentType = config.contentType || 'application/json';
     const bodyFormat = config.bodyFormat || 'json';
 
-    switch (bodyFormat) {
-      case 'form':
-        return this.buildFormDataBody(context);
-      case 'text':
-        return this.buildTextBody(context);
-      case 'xml':
-        return this.buildXmlBody(context);
-      case 'json':
-      default:
-        return JSON.stringify(context);
+    // Handle null/undefined context
+    if (context === null || context === undefined) {
+      return '';
+    }
+
+    // Handle empty context
+    if (typeof context === 'object' && Object.keys(context).length === 0) {
+      return bodyFormat === 'json' ? '{}' : '';
+    }
+
+    // Apply body transformation if configured
+    let transformedContext = context;
+    if (config.metadata?.bodyTransform) {
+      transformedContext = this.applyBodyTransform(context, config.metadata.bodyTransform);
+    }
+
+    try {
+      switch (bodyFormat) {
+        case 'form':
+          return this.buildFormDataBody(transformedContext);
+        case 'text':
+          return this.buildTextBody(transformedContext);
+        case 'xml':
+          return this.buildXmlBody(transformedContext);
+        case 'json':
+        default:
+          return JSON.stringify(transformedContext);
+      }
+    } catch (error) {
+      logger.warn('Failed to build request body, falling back to JSON stringify', {
+        toolId: config.id,
+        bodyFormat,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      });
+      return JSON.stringify(transformedContext);
     }
   }
 
   private buildFormDataBody(context: any): string {
     const formData = new URLSearchParams();
     
-    for (const [key, value] of Object.entries(context)) {
-      if (value !== null && value !== undefined) {
-        formData.append(key, String(value));
+    // Handle nested objects by flattening them
+    const flattenObject = (obj: any, prefix = ''): void => {
+      for (const [key, value] of Object.entries(obj)) {
+        if (value === null || value === undefined) {
+          continue;
+        }
+        
+        const fullKey = prefix ? `${prefix}[${key}]` : key;
+        
+        if (typeof value === 'object' && !Array.isArray(value)) {
+          flattenObject(value, fullKey);
+        } else if (Array.isArray(value)) {
+          value.forEach((item, index) => {
+            if (typeof item === 'object' && item !== null) {
+              flattenObject(item, `${fullKey}[${index}]`);
+            } else {
+              formData.append(`${fullKey}[${index}]`, String(item));
+            }
+          });
+        } else {
+          formData.append(fullKey, String(value));
+        }
       }
-    }
+    };
     
+    flattenObject(context);
     return formData.toString();
   }
 
@@ -658,8 +1328,20 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       return context;
     }
     
-    if (context.text) {
-      return String(context.text);
+    // Try to find a text field with common names
+    const textFields = ['text', 'content', 'message', 'body', 'data', 'input', 'query', 'prompt'];
+    for (const field of textFields) {
+      if (context[field] && typeof context[field] === 'string') {
+        return context[field];
+      }
+    }
+    
+    // If it's a simple object with one string value, use that
+    if (typeof context === 'object' && context !== null) {
+      const entries = Object.entries(context);
+      if (entries.length === 1 && typeof entries[0][1] === 'string') {
+        return entries[0][1];
+      }
     }
     
     // Fallback to JSON string for complex objects

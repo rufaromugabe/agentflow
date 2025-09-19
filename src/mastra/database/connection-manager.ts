@@ -31,6 +31,10 @@ class DatabaseConnectionManager {
     }
 
     try {
+      logger.info('Initializing database connection', { 
+        connectionString: this.config.connectionString.replace(/\/\/.*@/, '//***:***@') // Hide credentials in logs
+      });
+
       this.pool = new Pool({
         connectionString: this.config.connectionString,
         max: this.config.maxConnections,
@@ -38,21 +42,63 @@ class DatabaseConnectionManager {
         connectionTimeoutMillis: this.config.connectionTimeoutMillis,
       });
 
-      // Test the connection
-      await this.testConnection();
+      // Test the connection with retry logic
+      await this.testConnectionWithRetry();
       
       this.isInitialized = true;
       logger.info('Database connection manager initialized successfully', {
         maxConnections: this.config.maxConnections
       });
     } catch (error) {
-      logger.error('Failed to initialize database connection manager', undefined, error instanceof Error ? error : undefined);
+      logger.error('Failed to initialize database connection manager', { 
+        error: error instanceof Error ? error.message : 'Unknown error',
+        connectionString: this.config.connectionString.replace(/\/\/.*@/, '//***:***@')
+      }, error instanceof Error ? error : undefined);
+      
+      // Provide more helpful error message
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       throw new AgentFlowError(
-        'Database initialization failed',
+        `Database initialization failed: ${errorMessage}`,
         'DATABASE_INIT_ERROR',
-        { connectionString: this.config.connectionString },
+        { 
+          connectionString: this.config.connectionString.replace(/\/\/.*@/, '//***:***@'),
+          originalError: errorMessage
+        },
         500
       );
+    }
+  }
+
+  private async testConnectionWithRetry(): Promise<void> {
+    if (!this.pool) {
+      throw new AgentFlowError('Database pool not initialized', 'DATABASE_NOT_INITIALIZED');
+    }
+
+    const maxRetries = 3;
+    const retryDelay = 1000; // 1 second
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const client = await this.pool.connect();
+        try {
+          await client.query('SELECT 1');
+          logger.debug('Database connection test successful', { attempt });
+          return;
+        } finally {
+          client.release();
+        }
+      } catch (error) {
+        logger.warn(`Database connection test failed (attempt ${attempt}/${maxRetries})`, {
+          error: error instanceof Error ? error.message : 'Unknown error'
+        });
+        
+        if (attempt === maxRetries) {
+          throw error;
+        }
+        
+        // Wait before retrying
+        await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
+      }
     }
   }
 
@@ -177,6 +223,13 @@ let connectionManager: DatabaseConnectionManager | null = null;
 export function getConnectionManager(): DatabaseConnectionManager {
   if (!connectionManager) {
     const connectionString = process.env.DATABASE_URL || 'postgresql://user:none@localhost:5432/agentflow';
+    
+    // Log the connection string being used (with credentials hidden)
+    logger.info('Using database connection', { 
+      connectionString: connectionString.replace(/\/\/.*@/, '//***:***@'),
+      hasEnvVar: !!process.env.DATABASE_URL
+    });
+    
     connectionManager = new DatabaseConnectionManager({ connectionString });
   }
   return connectionManager;
