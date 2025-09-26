@@ -2,9 +2,9 @@ import { Context } from 'hono';
 import type { StatusCode } from 'hono/utils/http-status';
 import { z } from 'zod';
 import { createDeploymentManager } from '../deployment/deployment-manager';
-import { createFastExecutor, FastExecutionContext } from '../execution/fast-executor';
 import { logger } from '../utils/logger';
 import { AgentFlowError } from '../utils/helpers';
+import { getAgentBuilder } from '../platform';
 
 // Request validation schemas
 const DeployAgentRequestSchema = z.object({
@@ -270,110 +270,102 @@ export class FastExecutionAPI {
       const body = await c.req.json();
       const organizationId = this.getOrganizationId(c);
       
-      // Validate request body
-      const validatedData = ExecuteAgentRequestSchema.parse(body);
+      // Get the deployed agent from the deployment manager instead of agent builder
+      const deploymentManager = createDeploymentManager(organizationId);
+      const deployedAgent = await deploymentManager.getDeployedAgentState(agentId);
       
-      logger.debug('Fast execution request received', {
-        agentId,
-        organizationId,
-        hasMessages: !!validatedData.messages,
-        hasPrompt: !!validatedData.prompt,
-        hasMessage: !!validatedData.message
-      });
-
-      // Create fast executor
-      const fastExecutor = createFastExecutor(organizationId);
-      
-      // Build memory options (matching the regular generate endpoint)
-      const memoryOptions: any = {};
-      if (validatedData.threadId || validatedData.thread) {
-        memoryOptions.thread = validatedData.threadId || validatedData.thread;
-      }
-      if (validatedData.resourceId || validatedData.resource) {
-        memoryOptions.resource = validatedData.resourceId || validatedData.resource;
-      }
-      
-      // Build execution context
-      const context: FastExecutionContext = {
-        agentId,
-        userId: this.getUserId(c),
-        organizationId,
-        environment: this.getEnvironment(c),
-        userTier: this.getUserTier(c),
-        requestId: this.generateRequestId()
-      };
-
-      // Execute the agent with the same format as regular generate endpoint
-      const inputMessage = validatedData.messages || validatedData.prompt || validatedData.message;
-      if (!inputMessage) {
+      if (!deployedAgent) {
         return c.json({
           success: false,
-          error: 'Validation failed',
-          details: "At least one of 'messages', 'prompt', or 'message' must be provided"
-        }, { status: 400 });
+          error: 'Agent not found',
+          details: `Agent with ID '${agentId}' not deployed in organization '${organizationId}'`,
+        }, 404);
       }
 
-      const result = await fastExecutor.executeAgent(
-        agentId,
-        {
-          message: Array.isArray(inputMessage) ? inputMessage.join('\n') : inputMessage,
-          options: {
-            maxSteps: validatedData.maxSteps,
-            temperature: validatedData.temperature,
-            toolChoice: 'auto',
-            ...(Object.keys(memoryOptions).length > 0 && { memory: memoryOptions }),
-          }
-        },
-        context
-      );
+      // Build memory options (identical to regular generate endpoint)
+      const memoryOptions: any = {};
+      if (body.threadId || body.thread) {
+        memoryOptions.thread = body.threadId || body.thread;
+      }
+      if (body.resourceId || body.resource) {
+        memoryOptions.resource = body.resourceId || body.resource;
+      }
+      
+      // Use the same agent retrieval approach as the working generate endpoint
+      const agentBuilder = getAgentBuilder(organizationId);
+      
+      // Try to get the agent using the agent builder first (like the working endpoint does)
+      let agent;
+      try {
+        agent = await agentBuilder.getAgent(agentId);
+        logger.debug('Retrieved agent via agent builder', { agentId, organizationId });
+      } catch (error) {
+        // If agent builder fails, fall back to manual construction from deployed config
+        logger.debug('Agent builder failed, using deployed configuration', { agentId, organizationId });
+        const { Agent } = await import('@mastra/core/agent');
+        
+        agent = new Agent({
+          name: deployedAgent.name,
+          description: deployedAgent.description,
+          instructions: deployedAgent.instructions,
+          model: deployedAgent.resolvedModel || deployedAgent.model,
+          tools: deployedAgent.resolvedTools || {},
+          memory: deployedAgent.resolvedMemory,
+          voice: deployedAgent.resolvedVoice,
+        });
+      }
 
-      logger.info('Fast agent execution completed via API', {
-        agentId,
-        organizationId,
-        userId: context.userId,
-        executionTime: result.totalExecutionTime,
-        databaseLoadTime: result.databaseLoadTime
+      // Execute with EXACTLY the same logic as regular generate endpoint
+      const result = await agent.generate(body.messages || body.prompt || body.message, {
+        output: body.output,
+        maxSteps: body.maxSteps,
+        maxTokens: body.maxTokens,
+        temperature: body.temperature,
+        topP: body.topP,
+        topK: body.topK,
+        presencePenalty: body.presencePenalty,
+        frequencyPenalty: body.frequencyPenalty,
+        stopSequences: body.stopSequences,
+        seed: body.seed,
+        abortSignal: body.abortSignal,
+        context: body.context,
+        instructions: body.instructions,
+        toolChoice: body.toolChoice,
+        toolsets: body.toolsets,
+        clientTools: body.clientTools,
+        inputProcessors: body.inputProcessors,
+        outputProcessors: body.outputProcessors,
+        structuredOutput: body.structuredOutput,
+        experimental_output: body.experimental_output,
+        telemetry: body.telemetry,
+        runtimeContext: body.runtimeContext,
+        runId: body.runId,
+        providerOptions: body.providerOptions,
+        ...(Object.keys(memoryOptions).length > 0 && { memory: memoryOptions }),
       });
 
-      // Return response in the same format as regular generate endpoint
+      // Return response in identical format to regular generate endpoint
       return c.json({
         success: true,
         data: {
           agentId,
           organizationId,
-          result: result.response,
+          result,
           memory: Object.keys(memoryOptions).length > 0 ? memoryOptions : null,
           timestamp: new Date().toISOString(),
         },
       });
-
     } catch (error) {
-      if (error instanceof z.ZodError) {
-        return c.json({
-          success: false,
-          error: 'Validation failed',
-          details: error.errors
-        }, { status: 400 });
-      } else if (error instanceof AgentFlowError) {
-        const statusCode = this.getStatusCodeForError(error.code);
-        c.status(statusCode);
-        return c.json({
-          success: false,
-          error: error.message,
-          code: error.code
-        });
-      } else {
-        logger.error('Fast agent execution API error', {
-          agentId,
-          organizationId: this.getOrganizationId(c)
-        }, error instanceof Error ? error : undefined);
+      logger.error('Execute deployed agent API error', {
+        agentId,
+        organizationId: this.getOrganizationId(c)
+      }, error instanceof Error ? error : undefined);
 
-        return c.json({
-          success: false,
-          error: 'Failed to execute agent',
-          details: error instanceof Error ? error.message : 'Unknown error'
-        }, { status: 500 });
-      }
+      return c.json({
+        success: false,
+        error: 'Failed to generate response',
+        details: error instanceof Error ? error.message : 'Unknown error',
+      }, 500);
     }
   }
 
@@ -384,15 +376,15 @@ export class FastExecutionAPI {
   async getExecutionStatus(c: Context): Promise<Response> {
     try {
       const organizationId = this.getOrganizationId(c);
-      const fastExecutor = createFastExecutor(organizationId);
-      const status = fastExecutor.getExecutionStatus();
+      const deploymentManager = createDeploymentManager(organizationId);
+      const deployedAgents = await deploymentManager.listDeployedAgents();
 
       return c.json({
         success: true,
         data: {
           organizationId,
-          runningExecutions: status.runningExecutions,
-          rateLimiterEntries: status.rateLimiterEntries,
+          deployedAgents: deployedAgents.length,
+          agentIds: deployedAgents.map(agent => agent.id),
           timestamp: new Date().toISOString()
         }
       });
