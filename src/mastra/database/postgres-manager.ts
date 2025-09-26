@@ -2,7 +2,7 @@ import { Pool, PoolClient } from 'pg';
 import { PostgresStore } from '@mastra/pg';
 import { DatabaseSchema, AgentTable, ToolTable, ToolTemplateTable, AgentExecutionTable, ToolExecutionTable, AnalyticsTable } from '../types';
 import { logger } from '../utils/logger';
-import { AgentFlowError, validateOrganizationId } from '../utils/helpers';
+import { AgentFlowError, validateOrganizationId, safeJsonParse, safeJsonStringify } from '../utils/helpers';
 import { getConnectionManager } from './connection-manager';
 
 // PostgreSQL Database Manager
@@ -78,7 +78,7 @@ export class PostgreSQLManager {
   }
 
   private async createTables(connectionManager: any, organizationId: string, schema: DatabaseSchema): Promise<void> {
-    // Create agents table
+    // Create agents table with deployment state
     await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".agents (
         id VARCHAR(255) PRIMARY KEY,
@@ -93,11 +93,16 @@ export class PostgreSQLManager {
         metadata JSONB,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        workspace_id VARCHAR(255)
+        workspace_id VARCHAR(255),
+        -- Deployment state for fast execution
+        is_deployed BOOLEAN DEFAULT FALSE,
+        deployed_state JSONB,
+        deployed_at TIMESTAMP,
+        version INTEGER DEFAULT 1
       )
     `);
 
-    // Create tools table
+    // Create tools table with deployment state
     await connectionManager.query(`
       CREATE TABLE IF NOT EXISTS "${organizationId}".tools (
         id VARCHAR(255) PRIMARY KEY,
@@ -118,7 +123,12 @@ export class PostgreSQLManager {
         metadata JSONB,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        workspace_id VARCHAR(255)
+        workspace_id VARCHAR(255),
+        -- Deployment state for fast execution
+        is_deployed BOOLEAN DEFAULT FALSE,
+        deployed_state JSONB,
+        deployed_at TIMESTAMP,
+        version INTEGER DEFAULT 1
       )
     `);
 
@@ -192,6 +202,23 @@ export class PostgreSQLManager {
 
     // Create memory-related tables for Mastra memory system
     await this.createMemoryTables(connectionManager, organizationId);
+
+    // Ensure deployment columns exist on legacy installations
+    await connectionManager.query(`
+      ALTER TABLE "${organizationId}".agents 
+      ADD COLUMN IF NOT EXISTS is_deployed BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS deployed_state JSONB,
+      ADD COLUMN IF NOT EXISTS deployed_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS version INTEGER DEFAULT 1
+    `);
+
+    await connectionManager.query(`
+      ALTER TABLE "${organizationId}".tools 
+      ADD COLUMN IF NOT EXISTS is_deployed BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS deployed_state JSONB,
+      ADD COLUMN IF NOT EXISTS deployed_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS version INTEGER DEFAULT 1
+    `);
 
     // Create indexes
     await this.createIndexes(connectionManager, organizationId);
@@ -290,10 +317,14 @@ export class PostgreSQLManager {
       `CREATE INDEX IF NOT EXISTS idx_agents_status ON "${organizationId}".agents (status)`,
       `CREATE INDEX IF NOT EXISTS idx_agents_created_at ON "${organizationId}".agents (created_at)`,
       `CREATE INDEX IF NOT EXISTS idx_agents_workspace_id ON "${organizationId}".agents (workspace_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_agents_is_deployed ON "${organizationId}".agents (is_deployed)`,
+      `CREATE INDEX IF NOT EXISTS idx_agents_deployed_at ON "${organizationId}".agents (deployed_at)`,
       
       `CREATE INDEX IF NOT EXISTS idx_tools_status ON "${organizationId}".tools (status)`,
       `CREATE INDEX IF NOT EXISTS idx_tools_created_at ON "${organizationId}".tools (created_at)`,
       `CREATE INDEX IF NOT EXISTS idx_tools_workspace_id ON "${organizationId}".tools (workspace_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_tools_is_deployed ON "${organizationId}".tools (is_deployed)`,
+      `CREATE INDEX IF NOT EXISTS idx_tools_deployed_at ON "${organizationId}".tools (deployed_at)`,
       
       `CREATE INDEX IF NOT EXISTS idx_tool_templates_category ON "${organizationId}".tool_templates (category)`,
       `CREATE INDEX IF NOT EXISTS idx_tool_templates_created_at ON "${organizationId}".tool_templates (created_at)`,
@@ -640,6 +671,183 @@ export class PostgreSQLManager {
       metadata: undefined,
       timestamp: new Date(),
     };
+  }
+
+  // Deployment methods for fast execution
+  async deployAgent(organizationId: string, agentId: string, deployedState: any): Promise<boolean> {
+    const connectionManager = getConnectionManager();
+    try {
+      const query = `
+        UPDATE "${organizationId}".agents 
+        SET is_deployed = TRUE, deployed_state = $2, deployed_at = CURRENT_TIMESTAMP, version = version + 1
+        WHERE id = $1
+        RETURNING *
+      `;
+      
+      const result = await connectionManager.query(query, [agentId, safeJsonStringify(deployedState)]);
+      return result.length > 0;
+    } catch (error) {
+      logger.error('Failed to deploy agent', { organizationId, agentId }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async deployTool(organizationId: string, toolId: string, deployedState: any): Promise<boolean> {
+    const connectionManager = getConnectionManager();
+    try {
+      const query = `
+        UPDATE "${organizationId}".tools 
+        SET is_deployed = TRUE, deployed_state = $2, deployed_at = CURRENT_TIMESTAMP, version = version + 1
+        WHERE id = $1
+        RETURNING *
+      `;
+      
+      const result = await connectionManager.query(query, [toolId, safeJsonStringify(deployedState)]);
+      return result.length > 0;
+    } catch (error) {
+      logger.error('Failed to deploy tool', { organizationId, toolId }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async getDeployedAgentState(organizationId: string, agentId: string): Promise<any> {
+    const connectionManager = getConnectionManager();
+    try {
+      const query = `
+        SELECT is_deployed, deployed_state, deployed_at, version 
+        FROM "${organizationId}".agents 
+        WHERE id = $1 AND is_deployed = TRUE
+        LIMIT 1
+      `;
+      
+      const result = await connectionManager.query(query, [agentId]);
+      if (result.length === 0) {
+        return null;
+      }
+      
+      const row = result[0];
+      return {
+        isDeployed: row.is_deployed,
+        deployedState: safeJsonParse(row.deployed_state, null),
+        deployedAt: row.deployed_at,
+        version: row.version
+      };
+    } catch (error) {
+      logger.error('Failed to get deployed agent state', { organizationId, agentId }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async getDeployedToolState(organizationId: string, toolId: string): Promise<any> {
+    const connectionManager = getConnectionManager();
+    try {
+      const query = `
+        SELECT is_deployed, deployed_state, deployed_at, version 
+        FROM "${organizationId}".tools 
+        WHERE id = $1 AND is_deployed = TRUE
+        LIMIT 1
+      `;
+      
+      const result = await connectionManager.query(query, [toolId]);
+      if (result.length === 0) {
+        return null;
+      }
+      
+      const row = result[0];
+      return {
+        isDeployed: row.is_deployed,
+        deployedState: safeJsonParse(row.deployed_state, null),
+        deployedAt: row.deployed_at,
+        version: row.version
+      };
+    } catch (error) {
+      logger.error('Failed to get deployed tool state', { organizationId, toolId }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async listDeployedAgents(organizationId: string): Promise<any[]> {
+    const connectionManager = getConnectionManager();
+    try {
+      const query = `
+        SELECT id, name, deployed_state, deployed_at, version 
+        FROM "${organizationId}".agents 
+        WHERE is_deployed = TRUE AND status = 'active'
+        ORDER BY deployed_at DESC
+      `;
+      
+      const result = await connectionManager.query(query);
+      return result.map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        deployedState: safeJsonParse(row.deployed_state, null),
+        deployedAt: row.deployed_at,
+        version: row.version
+      }));
+    } catch (error) {
+      logger.error('Failed to list deployed agents', { organizationId }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async listDeployedTools(organizationId: string): Promise<any[]> {
+    const connectionManager = getConnectionManager();
+    try {
+      const query = `
+        SELECT id, name, deployed_state, deployed_at, version 
+        FROM "${organizationId}".tools 
+        WHERE is_deployed = TRUE AND status = 'active'
+        ORDER BY deployed_at DESC
+      `;
+      
+      const result = await connectionManager.query(query);
+      return result.map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        deployedState: safeJsonParse(row.deployed_state, null),
+        deployedAt: row.deployed_at,
+        version: row.version
+      }));
+    } catch (error) {
+      logger.error('Failed to list deployed tools', { organizationId }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async undeployAgent(organizationId: string, agentId: string): Promise<boolean> {
+    const connectionManager = getConnectionManager();
+    try {
+      const query = `
+        UPDATE "${organizationId}".agents 
+        SET is_deployed = FALSE, deployed_state = NULL, deployed_at = NULL
+        WHERE id = $1
+        RETURNING *
+      `;
+      
+      const result = await connectionManager.query(query, [agentId]);
+      return result.length > 0;
+    } catch (error) {
+      logger.error('Failed to undeploy agent', { organizationId, agentId }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async undeployTool(organizationId: string, toolId: string): Promise<boolean> {
+    const connectionManager = getConnectionManager();
+    try {
+      const query = `
+        UPDATE "${organizationId}".tools 
+        SET is_deployed = FALSE, deployed_state = NULL, deployed_at = NULL
+        WHERE id = $1
+        RETURNING *
+      `;
+      
+      const result = await connectionManager.query(query, [toolId]);
+      return result.length > 0;
+    } catch (error) {
+      logger.error('Failed to undeploy tool', { organizationId, toolId }, error instanceof Error ? error : undefined);
+      throw error;
+    }
   }
 
   // Close method removed - using centralized connection manager

@@ -2,6 +2,7 @@ import { createTool } from '@mastra/core/tools';
 import { RuntimeContext } from '@mastra/core/runtime-context';
 import { z } from 'zod';
 import { postgresManager } from '../database/postgres-manager';
+import { createDeploymentManager } from '../deployment/deployment-manager';
 import { logger } from '../utils/logger';
 import { AgentFlowError, safeJsonParse, safeJsonStringify, validateOrganizationId } from '../utils/helpers';
 import { cacheManager, cacheKey, invalidateToolCache } from '../utils/cache';
@@ -45,6 +46,11 @@ export interface DynamicToolBuilder {
     error?: string;
     lastChecked: string;
   }>>;
+  // Deployment methods
+  deployTool(toolId: string, options?: any): Promise<any>;
+  undeployTool(toolId: string): Promise<boolean>;
+  isToolDeployed(toolId: string): Promise<boolean>;
+  getDeployedToolState(toolId: string): Promise<any>;
 }
 
 // Dynamic Tool Builder Implementation
@@ -52,6 +58,7 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
   private tools: Map<string, any> = new Map();
   private configs: Map<string, ToolConfig> = new Map();
   private templates: Map<string, ToolTemplate> = new Map();
+  private deploymentManager: any;
   private organizationId: string;
 
   constructor(organizationId: string = 'default') {
@@ -64,6 +71,8 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       await postgresManager.initializeOrganization(this.organizationId);
       // Load existing tools from database
       await this.loadToolsFromDatabase();
+      // Initialize the deployment manager
+      this.deploymentManager = createDeploymentManager(this.organizationId);
     } catch (error) {
       console.error('Failed to initialize database for tools:', error);
     }
@@ -1483,6 +1492,98 @@ export class DynamicToolBuilderImpl implements DynamicToolBuilder {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  // Deployment methods
+  async deployTool(toolId: string, options: any = {}): Promise<any> {
+    try {
+      if (!this.deploymentManager) {
+        throw new AgentFlowError(
+          'Deployment manager not initialized',
+          'DEPLOYMENT_MANAGER_NOT_INITIALIZED',
+          { toolId, organizationId: this.organizationId }
+        );
+      }
+
+      const result = await this.deploymentManager.deployTool(toolId, options);
+      
+      if (result.success) {
+        logger.info('Tool deployed via builder', { 
+          toolId, 
+          organizationId: this.organizationId
+        });
+      }
+
+      return result;
+    } catch (error) {
+      logger.error('Failed to deploy tool via builder', { 
+        toolId, 
+        organizationId: this.organizationId 
+      }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async undeployTool(toolId: string): Promise<boolean> {
+    try {
+      if (!this.deploymentManager) {
+        throw new AgentFlowError(
+          'Deployment manager not initialized',
+          'DEPLOYMENT_MANAGER_NOT_INITIALIZED',
+          { toolId, organizationId: this.organizationId }
+        );
+      }
+
+      const success = await this.deploymentManager.undeployTool(toolId);
+      
+      if (success) {
+        logger.info('Tool undeployed via builder', { 
+          toolId, 
+          organizationId: this.organizationId 
+        });
+      }
+
+      return success;
+    } catch (error) {
+      logger.error('Failed to undeploy tool via builder', { 
+        toolId, 
+        organizationId: this.organizationId 
+      }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async isToolDeployed(toolId: string): Promise<boolean> {
+    try {
+      if (!this.deploymentManager) {
+        return false;
+      }
+
+      const deployedState = await this.deploymentManager.getDeployedToolState(toolId);
+      return !!deployedState;
+    } catch (error) {
+      logger.error('Failed to check tool deployment status', { 
+        toolId, 
+        organizationId: this.organizationId 
+      }, error instanceof Error ? error : undefined);
+      return false;
+    }
+  }
+
+  async getDeployedToolState(toolId: string): Promise<any> {
+    try {
+      if (!this.deploymentManager) {
+        return null;
+      }
+
+      return await this.deploymentManager.getDeployedToolState(toolId);
+    } catch (error) {
+      logger.error('Failed to get deployed tool state', { 
+        toolId, 
+        organizationId: this.organizationId 
+      }, error instanceof Error ? error : undefined);
+      return null;
     }
   }
 }

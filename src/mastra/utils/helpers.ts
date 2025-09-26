@@ -20,7 +20,7 @@ export function safeJsonStringify(value: any, defaultValue: string = '{}'): stri
   try {
     return JSON.stringify(value);
   } catch (error) {
-    logger.warn('Failed to stringify JSON', { value, error: error instanceof Error ? error.message : 'Unknown error' });
+    logger.warn('Failed to stringify JSON - circular reference detected', { error: error instanceof Error ? error.message : 'Unknown error' });
     return defaultValue;
   }
 }

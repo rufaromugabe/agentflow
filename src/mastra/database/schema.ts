@@ -1,4 +1,5 @@
 import { DatabaseSchema, AgentTable, ToolTable, ToolTemplateTable, AgentExecutionTable, ToolExecutionTable, AnalyticsTable } from '../types';
+import { safeJsonParse } from '../utils/helpers';
 
 // Database schema implementation following the memory about organization-based schemas
 export class DatabaseSchemaManager {
@@ -412,11 +413,11 @@ export class DatabaseManager {
       description: row.description,
       instructions: row.instructions,
       model: row.model,
-      tools: JSON.parse(row.tools || '[]'),
-      memory_config: row.memory_config ? JSON.parse(row.memory_config) : undefined,
-      voice_config: row.voice_config ? JSON.parse(row.voice_config) : undefined,
+      tools: safeJsonParse(row.tools, []) || [],
+      memory_config: safeJsonParse(row.memory_config, undefined) || undefined,
+      voice_config: safeJsonParse(row.voice_config, undefined) || undefined,
       status: row.status,
-      metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
+      metadata: safeJsonParse(row.metadata, undefined) || undefined,
       created_at: row.created_at,
       updated_at: row.updated_at,
       workspace_id: row.workspace_id,
@@ -480,17 +481,17 @@ export class DatabaseManager {
 
     const result = await this.executeSQL(sql, params);
     
-    return result.map(row => ({
+    return result.map((row: any) => ({
       id: row.id,
       name: row.name,
       description: row.description,
       instructions: row.instructions,
       model: row.model,
-      tools: JSON.parse(row.tools || '[]'),
-      memory_config: row.memory_config ? JSON.parse(row.memory_config) : undefined,
-      voice_config: row.voice_config ? JSON.parse(row.voice_config) : undefined,
+      tools: safeJsonParse(row.tools, []) || [],
+      memory_config: safeJsonParse(row.memory_config, undefined) || undefined,
+      voice_config: safeJsonParse(row.voice_config, undefined) || undefined,
       status: row.status,
-      metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
+      metadata: safeJsonParse(row.metadata, undefined) || undefined,
       created_at: row.created_at,
       updated_at: row.updated_at,
       workspace_id: row.workspace_id,

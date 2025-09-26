@@ -5,6 +5,7 @@ import { DynamicAgentBuilder } from '../agents/dynamic-agent-builder';
 import { DynamicToolBuilder, createDynamicToolBuilder } from '../tools/dynamic-tool-builder';
 import { getAgentBuilder } from '../platform';
 import { cacheManager, cacheKey, invalidateToolCache } from '../utils/cache';
+import { deploymentAPI, fastExecutionAPI } from './deployment-routes';
 
 /**
  * Consolidated AgentFlow Routes
@@ -2337,6 +2338,90 @@ export function createAgentFlowRoutes(
           },
           '500': { description: 'Export failed' },
         },
+      },
+    }),
+
+    // Deployment Routes (appear in Swagger)
+    registerApiRoute('/agentflow/api/deploy/agents/:agentId', {
+      method: 'POST',
+      handler: (c) => deploymentAPI.deployAgent(c),
+      openapi: {
+        summary: 'Deploy agent for fast execution',
+        description: 'Pre-resolve and store an agent configuration for fast runtime execution.',
+        tags: ['AgentFlow - Deployment'],
+        parameters: [
+          { name: 'agentId', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        responses: {
+          '201': { description: 'Agent deployed successfully' },
+          '400': { description: 'Validation failed' },
+          '500': { description: 'Internal server error' },
+        },
+      },
+    }),
+
+    registerApiRoute('/agentflow/api/deploy/agents/:agentId', {
+      method: 'DELETE',
+      handler: (c) => deploymentAPI.undeployAgent(c),
+      openapi: {
+        summary: 'Undeploy agent',
+        description: 'Remove an agent from fast execution state.',
+        tags: ['AgentFlow - Deployment'],
+        parameters: [
+          { name: 'agentId', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        responses: {
+          '200': { description: 'Agent undeployed' },
+          '404': { description: 'Agent not found' },
+        },
+      },
+    }),
+
+    registerApiRoute('/agentflow/api/deploy/agents', {
+      method: 'GET',
+      handler: (c) => deploymentAPI.listDeployedAgents(c),
+      openapi: {
+        summary: 'List deployed agents',
+        tags: ['AgentFlow - Deployment'],
+        responses: { '200': { description: 'OK' } },
+      },
+    }),
+
+    registerApiRoute('/agentflow/api/deploy/agents/:agentId/status', {
+      method: 'GET',
+      handler: (c) => deploymentAPI.getAgentDeploymentStatus(c),
+      openapi: {
+        summary: 'Get agent deployment status',
+        tags: ['AgentFlow - Deployment'],
+        parameters: [
+          { name: 'agentId', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        responses: { '200': { description: 'OK' } },
+      },
+    }),
+
+
+    // Fast Execution Routes (appear in Swagger)
+    registerApiRoute('/agentflow/api/execute/agents/:agentId', {
+      method: 'POST',
+      handler: (c) => fastExecutionAPI.executeAgent(c),
+      openapi: {
+        summary: 'Execute agent (fast path)',
+        description: 'Execute a pre-deployed agent with minimal latency.',
+        tags: ['AgentFlow - Execution'],
+        parameters: [
+          { name: 'agentId', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        responses: { '200': { description: 'OK' }, '400': { description: 'Bad request' } },
+      },
+    }),
+    registerApiRoute('/agentflow/api/execute/status', {
+      method: 'GET',
+      handler: (c) => fastExecutionAPI.getExecutionStatus(c),
+      openapi: {
+        summary: 'Get execution status',
+        tags: ['AgentFlow - Execution'],
+        responses: { '200': { description: 'OK' } },
       },
     }),
   ];

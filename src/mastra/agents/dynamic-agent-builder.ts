@@ -4,6 +4,7 @@ import { openai } from '@ai-sdk/openai';
 import { z } from 'zod';
 import { postgresManager } from '../database/postgres-manager';
 import { createDynamicToolBuilder } from '../tools/dynamic-tool-builder';
+import { createDeploymentManager } from '../deployment/deployment-manager';
 import { logger } from '../utils/logger';
 import { AgentFlowError, safeJsonParse, safeJsonStringify, validateOrganizationId } from '../utils/helpers';
 import { cacheManager, cacheKey, invalidateAgentCache } from '../utils/cache';
@@ -37,6 +38,11 @@ export interface DynamicAgentBuilder {
   listAgents(): Promise<AgentConfig[]>;
   deleteAgent(agentId: string): Promise<boolean>;
   registerTool(toolId: string, tool: any): void;
+  // Deployment methods
+  deployAgent(agentId: string, options?: any): Promise<any>;
+  undeployAgent(agentId: string): Promise<boolean>;
+  isAgentDeployed(agentId: string): Promise<boolean>;
+  getDeployedAgentState(agentId: string): Promise<any>;
 }
 
 // Runtime context for dynamic agent configuration
@@ -55,6 +61,7 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
   private configs: Map<string, AgentConfig> = new Map();
   private toolRegistry: Map<string, any> = new Map();
   private toolBuilder: any;
+  private deploymentManager: any;
   private organizationId: string = 'default';
 
   constructor(organizationId: string = 'default') {
@@ -79,6 +86,9 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
           this.toolRegistry.set(toolConfig.id, tool);
         }
       }
+      
+      // Initialize the deployment manager
+      this.deploymentManager = createDeploymentManager(this.organizationId);
       
       // Initialize the memory system for this organization
       const { initializeOrganizationMemory } = require('../memory/organization-memory');
@@ -513,6 +523,99 @@ export class DynamicAgentBuilderImpl implements DynamicAgentBuilder {
     }
 
     return agent;
+  }
+
+  // Deployment methods
+  async deployAgent(agentId: string, options: any = {}): Promise<any> {
+    try {
+      if (!this.deploymentManager) {
+        throw new AgentFlowError(
+          'Deployment manager not initialized',
+          'DEPLOYMENT_MANAGER_NOT_INITIALIZED',
+          { agentId, organizationId: this.organizationId }
+        );
+      }
+
+      const result = await this.deploymentManager.deployAgent(agentId, options);
+      
+      if (result.success) {
+        logger.info('Agent deployed via builder', { 
+          agentId, 
+          organizationId: this.organizationId,
+          toolCount: result.toolIds?.length || 0
+        });
+      }
+
+      return result;
+    } catch (error) {
+      logger.error('Failed to deploy agent via builder', { 
+        agentId, 
+        organizationId: this.organizationId 
+      }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async undeployAgent(agentId: string): Promise<boolean> {
+    try {
+      if (!this.deploymentManager) {
+        throw new AgentFlowError(
+          'Deployment manager not initialized',
+          'DEPLOYMENT_MANAGER_NOT_INITIALIZED',
+          { agentId, organizationId: this.organizationId }
+        );
+      }
+
+      const success = await this.deploymentManager.undeployAgent(agentId);
+      
+      if (success) {
+        logger.info('Agent undeployed via builder', { 
+          agentId, 
+          organizationId: this.organizationId 
+        });
+      }
+
+      return success;
+    } catch (error) {
+      logger.error('Failed to undeploy agent via builder', { 
+        agentId, 
+        organizationId: this.organizationId 
+      }, error instanceof Error ? error : undefined);
+      throw error;
+    }
+  }
+
+  async isAgentDeployed(agentId: string): Promise<boolean> {
+    try {
+      if (!this.deploymentManager) {
+        return false;
+      }
+
+      const deployedState = await this.deploymentManager.getDeployedAgentState(agentId);
+      return !!deployedState;
+    } catch (error) {
+      logger.error('Failed to check agent deployment status', { 
+        agentId, 
+        organizationId: this.organizationId 
+      }, error instanceof Error ? error : undefined);
+      return false;
+    }
+  }
+
+  async getDeployedAgentState(agentId: string): Promise<any> {
+    try {
+      if (!this.deploymentManager) {
+        return null;
+      }
+
+      return await this.deploymentManager.getDeployedAgentState(agentId);
+    } catch (error) {
+      logger.error('Failed to get deployed agent state', { 
+        agentId, 
+        organizationId: this.organizationId 
+      }, error instanceof Error ? error : undefined);
+      return null;
+    }
   }
 }
 
