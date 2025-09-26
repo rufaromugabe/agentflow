@@ -336,6 +336,170 @@ export class FastExecutionAPI {
   }
 
   /**
+   * Stream deployed agent response (real-time streaming)
+   * POST /api/execute/agents/:agentId/stream
+   */
+  async streamAgent(c: Context): Promise<Response> {
+    const { agentId } = c.req.param();
+    
+    try {
+      const body = await c.req.json();
+      const organizationId = this.getOrganizationId(c);
+      
+      // Single agent lookup - optimized for speed
+      const agentBuilder = getAgentBuilder(organizationId);
+      const agent = await agentBuilder.getAgent(agentId);
+      
+      if (!agent) {
+        return c.json({
+          success: false,
+          error: 'Agent not found or not deployed',
+        }, 404);
+      }
+
+      // Build options object only with defined values (same as execute endpoint)
+      const options: any = {};
+      
+      // Memory options (only if needed)
+      if (body.threadId || body.thread || body.resourceId || body.resource) {
+        options.memory = {};
+        if (body.threadId || body.thread) options.memory.thread = body.threadId || body.thread;
+        if (body.resourceId || body.resource) options.memory.resource = body.resourceId || body.resource;
+      }
+      
+      // Only add defined options (avoid undefined checks in Mastra)
+      if (body.output !== undefined) options.output = body.output;
+      if (body.maxSteps !== undefined) options.maxSteps = body.maxSteps;
+      if (body.maxTokens !== undefined) options.maxTokens = body.maxTokens;
+      if (body.temperature !== undefined) options.temperature = body.temperature;
+      if (body.toolChoice !== undefined) options.toolChoice = body.toolChoice;
+      if (body.structuredOutput !== undefined) options.structuredOutput = body.structuredOutput;
+      if (body.providerOptions !== undefined) options.providerOptions = body.providerOptions;
+
+      // Check if model supports streamVNext (V2) or use regular stream (V1)
+      let stream;
+      try {
+        // Try streamVNext first (for V2 models)
+        stream = await agent.streamVNext(body.messages || body.prompt || body.message, options);
+      } catch (error) {
+        // If streamVNext fails (V1 model), fall back to regular stream
+        if (error instanceof Error && error.message.includes('V1 models are not supported for streamVNext')) {
+          stream = await agent.stream(body.messages || body.prompt || body.message, options);
+        } else {
+          throw error;
+        }
+      }
+      
+      // Check streaming format preference
+      const format = body.format || 'sse'; // Default to Server-Sent Events
+      
+      if (format === 'json') {
+        // JSON Lines streaming for easier client consumption
+        const headers = new Headers({
+          'Content-Type': 'application/x-ndjson',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+        });
+
+        const readable = new ReadableStream({
+          async start(controller) {
+            try {
+              // Send initial event
+              controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                type: 'start',
+                success: true,
+                agentId,
+              }) + '\n'));
+
+              // Stream text chunks (both stream() and streamVNext() have textStream)
+              for await (const chunk of stream.textStream) {
+                controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                  type: 'text-delta',
+                  chunk,
+                }) + '\n'));
+              }
+
+              // Send completion
+              controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                type: 'finish',
+                usage: await stream.usage,
+                finishReason: await stream.finishReason,
+              }) + '\n'));
+
+              controller.close();
+            } catch (error) {
+              controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                type: 'error',
+                error: error instanceof Error ? error.message : 'Stream error',
+              }) + '\n'));
+              controller.close();
+            }
+          },
+        });
+
+        return new Response(readable, { headers });
+      } else {
+        // Server-Sent Events format (default)
+        const headers = new Headers({
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Headers': 'Cache-Control',
+        });
+
+        const readable = new ReadableStream({
+          async start(controller) {
+            try {
+              // Send initial success event
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+                type: 'start',
+                success: true,
+                agentId,
+              })}\n\n`));
+
+              // Stream text chunks (both stream() and streamVNext() have textStream)
+              for await (const chunk of stream.textStream) {
+                const data = JSON.stringify({
+                  type: 'text-delta',
+                  chunk,
+                });
+                controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`));
+              }
+
+              // Send final usage and completion info
+              const finalData = JSON.stringify({
+                type: 'finish',
+                usage: await stream.usage,
+                finishReason: await stream.finishReason,
+              });
+              controller.enqueue(new TextEncoder().encode(`data: ${finalData}\n\n`));
+
+              controller.close();
+            } catch (error) {
+              const errorData = JSON.stringify({
+                type: 'error',
+                error: error instanceof Error ? error.message : 'Stream error',
+              });
+              controller.enqueue(new TextEncoder().encode(`data: ${errorData}\n\n`));
+              controller.close();
+            }
+          },
+        });
+
+        return new Response(readable, { headers });
+      }
+    } catch (error) {
+      return c.json({
+        success: false,
+        error: 'Failed to start stream',
+        details: error instanceof Error ? error.message : 'Unknown error',
+      }, 500);
+    }
+  }
+
+  /**
    * Get execution status and metrics
    * GET /api/execute/status
    */

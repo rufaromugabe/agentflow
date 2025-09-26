@@ -2462,6 +2462,76 @@ export function createAgentFlowRoutes(
         },
       },
     }),
+
+    // Streaming Execution Route
+    registerApiRoute('/agentflow/api/execute/agents/:agentId/stream', {
+      method: 'POST',
+      handler: (c) => fastExecutionAPI.streamAgent(c),
+      openapi: {
+        summary: 'Stream deployed agent response',
+        description: 'Stream real-time responses from a pre-deployed agent using Server-Sent Events (SSE). Provides immediate feedback as the agent generates text.',
+        tags: ['AgentFlow - Execution'],
+        parameters: [
+          { name: 'agentId', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  messages: { type: 'array', items: { type: 'string' }, description: 'Array of messages' },
+                  prompt: { type: 'string', description: 'Single prompt string' },
+                  message: { type: 'string', description: 'Single message string' },
+                  output: { type: 'object', description: 'Output schema' },
+                  maxSteps: { type: 'number', description: 'Maximum steps' },
+                  maxTokens: { type: 'number', description: 'Maximum tokens' },
+                  temperature: { type: 'number', description: 'Temperature setting' },
+                  topP: { type: 'number', description: 'Top-p setting' },
+                  threadId: { type: 'string', description: 'Thread ID for memory (alternative to thread)' },
+                  thread: { type: 'string', description: 'Thread ID for memory' },
+                  resourceId: { type: 'string', description: 'Resource ID for memory (alternative to resource)' },
+                  resource: { type: 'string', description: 'Resource ID for memory' },
+                  toolChoice: { type: 'string', description: 'Tool choice setting' },
+                  structuredOutput: { type: 'object', description: 'Structured output configuration' },
+                  providerOptions: { type: 'object', description: 'Provider-specific options' },
+                  format: { 
+                    type: 'string', 
+                    enum: ['sse', 'json'], 
+                    description: 'Streaming format: "sse" for Server-Sent Events (default), "json" for JSON Lines',
+                    default: 'sse'
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description: 'Real-time streaming response in the specified format',
+            content: {
+              'text/event-stream': {
+                schema: {
+                  type: 'string',
+                  description: 'Server-Sent Events stream with JSON data events (format: "sse")',
+                  example: 'data: {"type":"start","success":true,"agentId":"weather-agent"}\n\ndata: {"type":"text-delta","chunk":"Hello"}\n\ndata: {"type":"finish","usage":{"totalTokens":150}}\n\n'
+                }
+              },
+              'application/x-ndjson': {
+                schema: {
+                  type: 'string',
+                  description: 'JSON Lines stream with one JSON object per line (format: "json")',
+                  example: '{"type":"start","success":true,"agentId":"weather-agent"}\n{"type":"text-delta","chunk":"Hello"}\n{"type":"finish","usage":{"totalTokens":150}}\n'
+                }
+              },
+            },
+          },
+          '404': { description: 'Agent not found' },
+          '500': { description: 'Stream initialization failed' },
+        },
+      },
+    }),
+
     registerApiRoute('/agentflow/api/execute/status', {
       method: 'GET',
       handler: (c) => fastExecutionAPI.getExecutionStatus(c),
