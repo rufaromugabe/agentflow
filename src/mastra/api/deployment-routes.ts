@@ -260,7 +260,7 @@ export class FastExecutionAPI {
   constructor() {}
 
   /**
-   * Execute deployed agent (fast path)
+   * Execute deployed agent (optimized for maximum speed)
    * POST /api/execute/agents/:agentId
    */
   async executeAgent(c: Context): Promise<Response> {
@@ -270,97 +270,63 @@ export class FastExecutionAPI {
       const body = await c.req.json();
       const organizationId = this.getOrganizationId(c);
       
-      // Get the deployed agent from the deployment manager instead of agent builder
-      const deploymentManager = createDeploymentManager(organizationId);
-      const deployedAgent = await deploymentManager.getDeployedAgentState(agentId);
+      // Single agent lookup - combines deployment check and agent retrieval
+      const agentBuilder = getAgentBuilder(organizationId);
+      const agent = await agentBuilder.getAgent(agentId);
       
-      if (!deployedAgent) {
+      if (!agent) {
         return c.json({
           success: false,
-          error: 'Agent not found',
-          details: `Agent with ID '${agentId}' not deployed in organization '${organizationId}'`,
+          error: 'Agent not found or not deployed',
         }, 404);
       }
 
-      // Build memory options (identical to regular generate endpoint)
-      const memoryOptions: any = {};
-      if (body.threadId || body.thread) {
-        memoryOptions.thread = body.threadId || body.thread;
-      }
-      if (body.resourceId || body.resource) {
-        memoryOptions.resource = body.resourceId || body.resource;
+      // Build options object only with defined values (faster than spread operator)
+      const options: any = {};
+      
+      // Memory options (only if needed)
+      if (body.threadId || body.thread || body.resourceId || body.resource) {
+        options.memory = {};
+        if (body.threadId || body.thread) options.memory.thread = body.threadId || body.thread;
+        if (body.resourceId || body.resource) options.memory.resource = body.resourceId || body.resource;
       }
       
-      // Use the same agent retrieval approach as the working generate endpoint
-      const agentBuilder = getAgentBuilder(organizationId);
-      
-      // Try to get the agent using the agent builder first (like the working endpoint does)
-      let agent;
-      try {
-        agent = await agentBuilder.getAgent(agentId);
-        logger.debug('Retrieved agent via agent builder', { agentId, organizationId });
-      } catch (error) {
-        // If agent builder fails, fall back to manual construction from deployed config
-        logger.debug('Agent builder failed, using deployed configuration', { agentId, organizationId });
-        const { Agent } = await import('@mastra/core/agent');
-        
-        agent = new Agent({
-          name: deployedAgent.name,
-          description: deployedAgent.description,
-          instructions: deployedAgent.instructions,
-          model: deployedAgent.resolvedModel || deployedAgent.model,
-          tools: deployedAgent.resolvedTools || {},
-          memory: deployedAgent.resolvedMemory,
-          voice: deployedAgent.resolvedVoice,
+      // Only add defined options (avoid undefined checks in Mastra)
+      if (body.output !== undefined) options.output = body.output;
+      if (body.maxSteps !== undefined) options.maxSteps = body.maxSteps;
+      if (body.maxTokens !== undefined) options.maxTokens = body.maxTokens;
+      if (body.temperature !== undefined) options.temperature = body.temperature;
+      if (body.toolChoice !== undefined) options.toolChoice = body.toolChoice;
+      if (body.structuredOutput !== undefined) options.structuredOutput = body.structuredOutput;
+      if (body.providerOptions !== undefined) options.providerOptions = body.providerOptions;
+
+      // Execute with optimized options
+      const result = await agent.generate(body.messages || body.prompt || body.message, options);
+
+      // Check if user wants minimal response (default) or full response
+      const minimal = body.minimal !== false; // Default to minimal unless explicitly set to false
+
+      if (minimal) {
+        // Ultra-minimal response for maximum speed - just essential data
+        return c.json({
+          success: true,
+          data: {
+            text: result.text,
+            toolCalls: result.toolCalls || [],
+            toolResults: result.toolResults || [],
+            finishReason: result.finishReason,
+            usage: result.usage,
+          },
+        });
+      } else {
+        // Full response for users who need all the metadata
+        return c.json({
+          success: true,
+          data: result,
         });
       }
-
-      // Execute with EXACTLY the same logic as regular generate endpoint
-      const result = await agent.generate(body.messages || body.prompt || body.message, {
-        output: body.output,
-        maxSteps: body.maxSteps,
-        maxTokens: body.maxTokens,
-        temperature: body.temperature,
-        topP: body.topP,
-        topK: body.topK,
-        presencePenalty: body.presencePenalty,
-        frequencyPenalty: body.frequencyPenalty,
-        stopSequences: body.stopSequences,
-        seed: body.seed,
-        abortSignal: body.abortSignal,
-        context: body.context,
-        instructions: body.instructions,
-        toolChoice: body.toolChoice,
-        toolsets: body.toolsets,
-        clientTools: body.clientTools,
-        inputProcessors: body.inputProcessors,
-        outputProcessors: body.outputProcessors,
-        structuredOutput: body.structuredOutput,
-        experimental_output: body.experimental_output,
-        telemetry: body.telemetry,
-        runtimeContext: body.runtimeContext,
-        runId: body.runId,
-        providerOptions: body.providerOptions,
-        ...(Object.keys(memoryOptions).length > 0 && { memory: memoryOptions }),
-      });
-
-      // Return response in identical format to regular generate endpoint
-      return c.json({
-        success: true,
-        data: {
-          agentId,
-          organizationId,
-          result,
-          memory: Object.keys(memoryOptions).length > 0 ? memoryOptions : null,
-          timestamp: new Date().toISOString(),
-        },
-      });
     } catch (error) {
-      logger.error('Execute deployed agent API error', {
-        agentId,
-        organizationId: this.getOrganizationId(c)
-      }, error instanceof Error ? error : undefined);
-
+      // Minimal error logging for production speed
       return c.json({
         success: false,
         error: 'Failed to generate response',
