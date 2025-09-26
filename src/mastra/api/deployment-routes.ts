@@ -19,24 +19,20 @@ const DeployAgentRequestSchema = z.object({
 
 
 const ExecuteAgentRequestSchema = z.object({
-  message: z.string().min(1),
-  context: z.object({
-    memory: z.object({
-      thread: z.string().optional(),
-      resource: z.string().optional(),
-    }).optional(),
-    runtimeContext: z.object({
-      userId: z.string().min(1),
-      environment: z.enum(['development', 'staging', 'production']).optional(),
-      userTier: z.enum(['free', 'pro', 'enterprise']).optional(),
-      customSettings: z.record(z.any()).optional(),
-    }).optional(),
-  }).optional(),
-  options: z.object({
-    maxSteps: z.number().min(1).max(50).optional(),
-    temperature: z.number().min(0).max(2).optional(),
-    toolChoice: z.enum(['auto', 'none', 'required']).optional(),
-  }).optional(),
+  messages: z.array(z.string()).optional(),
+  prompt: z.string().optional(),
+  message: z.string().optional(),
+  output: z.record(z.any()).optional(),
+  maxSteps: z.number().optional(),
+  maxTokens: z.number().optional(),
+  temperature: z.number().optional(),
+  topP: z.number().optional(),
+  threadId: z.string().optional(),
+  thread: z.string().optional(),
+  resourceId: z.string().optional(),
+  resource: z.string().optional(),
+}).refine(data => data.messages || data.prompt || data.message, {
+  message: "At least one of 'messages', 'prompt', or 'message' must be provided"
 });
 
 // Deployment API Controller
@@ -264,17 +260,39 @@ export class FastExecutionAPI {
   constructor() {}
 
   /**
-   * Execute agent with fast execution (pre-serialized configuration)
+   * Execute deployed agent (fast path)
    * POST /api/execute/agents/:agentId
    */
   async executeAgent(c: Context): Promise<Response> {
+    const { agentId } = c.req.param();
+    
     try {
-      const { agentId } = c.req.param();
-      const organizationId = this.getOrganizationId(c);
       const body = await c.req.json();
+      const organizationId = this.getOrganizationId(c);
       
+      // Validate request body
       const validatedData = ExecuteAgentRequestSchema.parse(body);
+      
+      logger.debug('Fast execution request received', {
+        agentId,
+        organizationId,
+        hasMessages: !!validatedData.messages,
+        hasPrompt: !!validatedData.prompt,
+        hasMessage: !!validatedData.message
+      });
 
+      // Create fast executor
+      const fastExecutor = createFastExecutor(organizationId);
+      
+      // Build memory options (matching the regular generate endpoint)
+      const memoryOptions: any = {};
+      if (validatedData.threadId || validatedData.thread) {
+        memoryOptions.thread = validatedData.threadId || validatedData.thread;
+      }
+      if (validatedData.resourceId || validatedData.resource) {
+        memoryOptions.resource = validatedData.resourceId || validatedData.resource;
+      }
+      
       // Build execution context
       const context: FastExecutionContext = {
         agentId,
@@ -282,33 +300,29 @@ export class FastExecutionAPI {
         organizationId,
         environment: this.getEnvironment(c),
         userTier: this.getUserTier(c),
-        customSettings: validatedData.context?.runtimeContext?.customSettings,
         requestId: this.generateRequestId()
       };
 
-      // Create fast executor and execute
-      const fastExecutor = createFastExecutor(organizationId);
+      // Execute the agent with the same format as regular generate endpoint
+      const inputMessage = validatedData.messages || validatedData.prompt || validatedData.message;
+      if (!inputMessage) {
+        return c.json({
+          success: false,
+          error: 'Validation failed',
+          details: "At least one of 'messages', 'prompt', or 'message' must be provided"
+        }, { status: 400 });
+      }
+
       const result = await fastExecutor.executeAgent(
         agentId,
         {
-          message: validatedData.message,
-          context: {
-            memory: validatedData.context?.memory?.thread && validatedData.context?.memory?.resource
-              ? {
-                  thread: validatedData.context.memory.thread,
-                  resource: validatedData.context.memory.resource
-                }
-              : undefined,
-            runtimeContext: {
-              agentId,
-              organizationId,
-              userId: context.userId,
-              environment: context.environment,
-              userTier: context.userTier,
-              ...(validatedData.context?.runtimeContext || {})
-            }
-          },
-          options: validatedData.options
+          message: Array.isArray(inputMessage) ? inputMessage.join('\n') : inputMessage,
+          options: {
+            maxSteps: validatedData.maxSteps,
+            temperature: validatedData.temperature,
+            toolChoice: 'auto',
+            ...(Object.keys(memoryOptions).length > 0 && { memory: memoryOptions }),
+          }
         },
         context
       );
@@ -321,20 +335,16 @@ export class FastExecutionAPI {
         databaseLoadTime: result.databaseLoadTime
       });
 
+      // Return response in the same format as regular generate endpoint
       return c.json({
         success: true,
         data: {
-          response: result.response,
-          usage: result.usage,
-          finishReason: result.finishReason,
-          toolCalls: result.toolCalls,
-          executionMetrics: {
-            executionTime: result.executionTime,
-            databaseLoadTime: result.databaseLoadTime,
-            agentCreationTime: result.agentCreationTime,
-            totalExecutionTime: result.totalExecutionTime
-          }
-        }
+          agentId,
+          organizationId,
+          result: result.response,
+          memory: Object.keys(memoryOptions).length > 0 ? memoryOptions : null,
+          timestamp: new Date().toISOString(),
+        },
       });
 
     } catch (error) {
@@ -354,12 +364,13 @@ export class FastExecutionAPI {
         });
       } else {
         logger.error('Fast agent execution API error', {
+          agentId,
           organizationId: this.getOrganizationId(c)
         }, error instanceof Error ? error : undefined);
 
         return c.json({
           success: false,
-          error: 'Internal server error',
+          error: 'Failed to execute agent',
           details: error instanceof Error ? error.message : 'Unknown error'
         }, { status: 500 });
       }

@@ -2406,13 +2406,60 @@ export function createAgentFlowRoutes(
       method: 'POST',
       handler: (c) => fastExecutionAPI.executeAgent(c),
       openapi: {
-        summary: 'Execute agent (fast path)',
-        description: 'Execute a pre-deployed agent with minimal latency.',
+        summary: 'Execute deployed agent',
+        description: 'Execute a pre-deployed agent with the same interface as the regular generate endpoint, but with optimized performance.',
         tags: ['AgentFlow - Execution'],
         parameters: [
           { name: 'agentId', in: 'path', required: true, schema: { type: 'string' } },
         ],
-        responses: { '200': { description: 'OK' }, '400': { description: 'Bad request' } },
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  messages: { type: 'array', items: { type: 'string' }, description: 'Array of messages' },
+                  prompt: { type: 'string', description: 'Single prompt string' },
+                  message: { type: 'string', description: 'Single message string' },
+                  output: { type: 'object', description: 'Output schema' },
+                  maxSteps: { type: 'number', description: 'Maximum steps' },
+                  maxTokens: { type: 'number', description: 'Maximum tokens' },
+                  temperature: { type: 'number', description: 'Temperature setting' },
+                  topP: { type: 'number', description: 'Top-p setting' },
+                  threadId: { type: 'string', description: 'Thread ID for memory (alternative to thread)' },
+                  thread: { type: 'string', description: 'Thread ID for memory' },
+                  resourceId: { type: 'string', description: 'Resource ID for memory (alternative to resource)' },
+                  resource: { type: 'string', description: 'Resource ID for memory' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description: 'Response generated successfully',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean' },
+                    data: {
+                      type: 'object',
+                      properties: {
+                        agentId: { type: 'string' },
+                        result: { type: 'object' },
+                        timestamp: { type: 'string', format: 'date-time' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '404': { description: 'Agent not found' },
+          '500': { description: 'Execution failed' },
+        },
       },
     }),
     registerApiRoute('/agentflow/api/execute/status', {
