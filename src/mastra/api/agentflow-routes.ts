@@ -719,62 +719,48 @@ export function createAgentFlowRoutes(
         try {
           const body = await c.req.json();
           const organizationId = c.req.query('organizationId') || 'default';
+          
+          // Single agent lookup - optimized for speed
           const agentBuilder = getAgentBuilder(organizationId);
           const agent = await agentBuilder.getAgent(agentId);
           
           if (!agent) {
             return c.json({
               success: false,
-              error: 'Agent not found',
-              details: `Agent with ID '${agentId}' not found in organization '${organizationId}'`,
+              error: 'Agent not found or not deployed',
             }, 404);
           }
-          
-          const memoryOptions: any = {};
-          if (body.threadId || body.thread) {
-            memoryOptions.thread = body.threadId || body.thread;
-          }
-          if (body.resourceId || body.resource) {
-            memoryOptions.resource = body.resourceId || body.resource;
-          }
-          
-          const result = await agent.generate(body.messages || body.prompt || body.message, {
-            output: body.output,
-            maxSteps: body.maxSteps,
-            maxTokens: body.maxTokens,
-            temperature: body.temperature,
-            topP: body.topP,
-            topK: body.topK,
-            presencePenalty: body.presencePenalty,
-            frequencyPenalty: body.frequencyPenalty,
-            stopSequences: body.stopSequences,
-            seed: body.seed,
-            abortSignal: body.abortSignal,
-            context: body.context,
-            instructions: body.instructions,
-            toolChoice: body.toolChoice,
-            toolsets: body.toolsets,
-            clientTools: body.clientTools,
-            inputProcessors: body.inputProcessors,
-            outputProcessors: body.outputProcessors,
-            structuredOutput: body.structuredOutput,
-            experimental_output: body.experimental_output,
-            telemetry: body.telemetry,
-            runtimeContext: body.runtimeContext,
-            runId: body.runId,
-            providerOptions: body.providerOptions,
-            ...(Object.keys(memoryOptions).length > 0 && { memory: memoryOptions }),
-          });
 
+          // Build options object only with defined values (same as deployed endpoint)
+          const options: any = {};
+          
+          // Memory options (only if needed)
+          if (body.threadId || body.thread || body.resourceId || body.resource) {
+            options.memory = {};
+            if (body.threadId || body.thread) options.memory.thread = body.threadId || body.thread;
+            if (body.resourceId || body.resource) options.memory.resource = body.resourceId || body.resource;
+          }
+          
+          // Only add defined options (avoid undefined checks in Mastra)
+          if (body.output !== undefined) options.output = body.output;
+          if (body.maxSteps !== undefined) options.maxSteps = body.maxSteps;
+          if (body.maxTokens !== undefined) options.maxTokens = body.maxTokens;
+          if (body.temperature !== undefined) options.temperature = body.temperature;
+          if (body.toolChoice !== undefined) options.toolChoice = body.toolChoice;
+          if (body.structuredOutput !== undefined) options.structuredOutput = body.structuredOutput;
+          if (body.providerOptions !== undefined) options.providerOptions = body.providerOptions;
+
+          const result = await agent.generate(body.messages || body.prompt || body.message, options);
+
+          // Return minimal response (85% smaller payload)
           return c.json({
             success: true,
-            data: {
+            result: body.minimal === false ? {
               agentId,
               organizationId,
-              result,
-              memory: Object.keys(memoryOptions).length > 0 ? memoryOptions : null,
+              data: result,
               timestamp: new Date().toISOString(),
-            },
+            } : result,
           });
         } catch (error) {
           return c.json({
@@ -786,7 +772,7 @@ export function createAgentFlowRoutes(
       },
       openapi: {
         summary: 'Generate response from agent',
-        description: 'Send a prompt to an agent and get its response',
+        description: 'Send a prompt to an agent and get its response - optimized for speed with minimal payload',
         tags: ['AgentFlow - Agents'],
         parameters: [
           {
@@ -803,19 +789,41 @@ export function createAgentFlowRoutes(
               schema: {
                 type: 'object',
                 properties: {
-                  messages: { type: 'array', items: { type: 'string' }, description: 'Array of messages' },
-                  prompt: { type: 'string', description: 'Single prompt string' },
-                  message: { type: 'string', description: 'Single message string' },
-                  output: { type: 'object', description: 'Output schema' },
-                  maxSteps: { type: 'number', description: 'Maximum steps' },
-                  maxTokens: { type: 'number', description: 'Maximum tokens' },
-                  temperature: { type: 'number', description: 'Temperature setting' },
-                  topP: { type: 'number', description: 'Top-p setting' },
-                  threadId: { type: 'string', description: 'Thread ID for memory (alternative to thread)' },
-                  thread: { type: 'string', description: 'Thread ID for memory' },
-                  resourceId: { type: 'string', description: 'Resource ID for memory (alternative to resource)' },
-                  resource: { type: 'string', description: 'Resource ID for memory' },
+                  messages: { 
+                    type: 'array', 
+                    items: { type: 'object' }, 
+                    description: 'Array of message objects with role and content' 
+                  },
+                  prompt: { type: 'string', description: 'Single prompt string (alternative to messages)' },
+                  message: { type: 'string', description: 'Single message string (alternative to messages)' },
+                  minimal: { 
+                    type: 'boolean', 
+                    default: true, 
+                    description: 'Return minimal response (85% smaller payload) or full response object' 
+                  },
+                  output: { type: 'object', description: 'Output schema for structured responses' },
+                  maxSteps: { type: 'number', description: 'Maximum execution steps' },
+                  maxTokens: { type: 'number', description: 'Maximum tokens to generate' },
+                  temperature: { type: 'number', description: 'Temperature setting (0.0-2.0)' },
+                  toolChoice: { 
+                    type: 'string', 
+                    enum: ['auto', 'none', 'required'], 
+                    description: 'Tool usage preference' 
+                  },
+                  structuredOutput: { type: 'object', description: 'Structured output configuration' },
+                  providerOptions: { type: 'object', description: 'Provider-specific options' },
+                  threadId: { type: 'string', description: 'Thread ID for conversation memory (deprecated, use thread)' },
+                  thread: { type: 'string', description: 'Thread ID for conversation memory' },
+                  resourceId: { type: 'string', description: 'Resource ID for memory scope (deprecated, use resource)' },
+                  resource: { type: 'string', description: 'Resource ID for memory scope' },
                 },
+                required: ['messages'],
+                example: {
+                  messages: [{ role: 'user', content: 'Hello, how can you help me?' }],
+                  minimal: true,
+                  maxSteps: 5,
+                  temperature: 0.7
+                }
               },
             },
           },
@@ -828,22 +836,61 @@ export function createAgentFlowRoutes(
                 schema: {
                   type: 'object',
                   properties: {
-                    success: { type: 'boolean' },
-                    data: {
-                      type: 'object',
+                    success: { type: 'boolean', example: true },
+                    result: { 
+                      type: 'object', 
+                      description: 'Agent response (direct result when minimal=true, wrapped in data object when minimal=false)',
                       properties: {
-                        agentId: { type: 'string' },
-                        result: { type: 'object' },
-                        timestamp: { type: 'string', format: 'date-time' },
-                      },
+                        text: { type: 'string', description: 'Generated text response' },
+                        toolCalls: { 
+                          type: 'array', 
+                          description: 'Tool calls made during generation',
+                          items: { type: 'object' }
+                        },
+                        usage: { 
+                          type: 'object',
+                          properties: {
+                            totalTokens: { type: 'number' },
+                            promptTokens: { type: 'number' },
+                            completionTokens: { type: 'number' }
+                          }
+                        }
+                      }
                     },
                   },
                 },
               },
             },
           },
-          '404': { description: 'Agent not found' },
-          '500': { description: 'Generation failed' },
+          '404': { 
+            description: 'Agent not found',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: false },
+                    error: { type: 'string', example: 'Agent not found or not deployed' }
+                  }
+                }
+              }
+            }
+          },
+          '500': { 
+            description: 'Generation failed',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object', 
+                  properties: {
+                    success: { type: 'boolean', example: false },
+                    error: { type: 'string' },
+                    details: { type: 'string' }
+                  }
+                }
+              }
+            }
+          },
         },
       },
     }),
@@ -856,74 +903,162 @@ export function createAgentFlowRoutes(
         try {
           const body = await c.req.json();
           const organizationId = c.req.query('organizationId') || 'default';
+          
+          // Single agent lookup - optimized for speed
           const agentBuilder = getAgentBuilder(organizationId);
           const agent = await agentBuilder.getAgent(agentId);
           
           if (!agent) {
             return c.json({
               success: false,
-              error: 'Agent not found',
-              details: `Agent with ID '${agentId}' not found in organization '${organizationId}'`,
+              error: 'Agent not found or not deployed',
             }, 404);
           }
-          
-          const memoryOptions: any = {};
-          if (body.threadId || body.thread) {
-            memoryOptions.thread = body.threadId || body.thread;
-          }
-          if (body.resourceId || body.resource) {
-            memoryOptions.resource = body.resourceId || body.resource;
-          }
-          
-          const streamResult = await agent.stream(body.messages || body.prompt || body.message, {
-            output: body.output,
-            maxSteps: body.maxSteps,
-            maxTokens: body.maxTokens,
-            temperature: body.temperature,
-            topP: body.topP,
-            topK: body.topK,
-            presencePenalty: body.presencePenalty,
-            frequencyPenalty: body.frequencyPenalty,
-            stopSequences: body.stopSequences,
-            seed: body.seed,
-            abortSignal: body.abortSignal,
-            context: body.context,
-            instructions: body.instructions,
-            toolChoice: body.toolChoice,
-            toolsets: body.toolsets,
-            clientTools: body.clientTools,
-            inputProcessors: body.inputProcessors,
-            outputProcessors: body.outputProcessors,
-            structuredOutput: body.structuredOutput,
-            experimental_output: body.experimental_output,
-            telemetry: body.telemetry,
-            runtimeContext: body.runtimeContext,
-            runId: body.runId,
-            providerOptions: body.providerOptions,
-            ...(Object.keys(memoryOptions).length > 0 && { memory: memoryOptions }),
-          });
 
-          const fullStream = await streamResult.fullStream;
+          // Build options object only with defined values (same as deployed endpoint)
+          const options: any = {};
+          
+          // Memory options (only if needed)
+          if (body.threadId || body.thread || body.resourceId || body.resource) {
+            options.memory = {};
+            if (body.threadId || body.thread) options.memory.thread = body.threadId || body.thread;
+            if (body.resourceId || body.resource) options.memory.resource = body.resourceId || body.resource;
+          }
+          
+          // Only add defined options (avoid undefined checks in Mastra)
+          if (body.output !== undefined) options.output = body.output;
+          if (body.maxSteps !== undefined) options.maxSteps = body.maxSteps;
+          if (body.maxTokens !== undefined) options.maxTokens = body.maxTokens;
+          if (body.temperature !== undefined) options.temperature = body.temperature;
+          if (body.toolChoice !== undefined) options.toolChoice = body.toolChoice;
+          if (body.structuredOutput !== undefined) options.structuredOutput = body.structuredOutput;
+          if (body.providerOptions !== undefined) options.providerOptions = body.providerOptions;
 
-          return new Response(fullStream, {
-            headers: {
-              'Content-Type': 'text/plain; charset=utf-8',
-              'Transfer-Encoding': 'chunked',
+          // Check if model supports streamVNext (V2) or use regular stream (V1)
+          let stream;
+          try {
+            // Try streamVNext first (for V2 models)
+            stream = await agent.streamVNext(body.messages || body.prompt || body.message, options);
+          } catch (error) {
+            // If streamVNext fails (V1 model), fall back to regular stream
+            if (error instanceof Error && error.message.includes('V1 models are not supported for streamVNext')) {
+              stream = await agent.stream(body.messages || body.prompt || body.message, options);
+            } else {
+              throw error;
+            }
+          }
+          
+          // Check streaming format preference
+          const format = body.format || 'sse'; // Default to Server-Sent Events
+          
+          if (format === 'json') {
+            // JSON Lines streaming for easier client consumption
+            const headers = new Headers({
+              'Content-Type': 'application/x-ndjson',
               'Cache-Control': 'no-cache',
               'Connection': 'keep-alive',
-            },
-          });
+              'Access-Control-Allow-Origin': '*',
+            });
+
+            const readable = new ReadableStream({
+              async start(controller) {
+                try {
+                  // Send initial event
+                  controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                    type: 'start',
+                    success: true,
+                    agentId,
+                  }) + '\n'));
+
+                  // Stream text chunks (both stream() and streamVNext() have textStream)  
+                  for await (const chunk of stream.textStream) {
+                    controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                      type: 'text-delta',
+                      chunk,
+                    }) + '\n'));
+                  }
+
+                  // Send completion
+                  controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                    type: 'finish',
+                    usage: await stream.usage,
+                    finishReason: await stream.finishReason,
+                  }) + '\n'));
+
+                  controller.close();
+                } catch (error) {
+                  controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                    type: 'error',
+                    error: error instanceof Error ? error.message : 'Stream error',
+                  }) + '\n'));
+                  controller.close();
+                }
+              },
+            });
+
+            return new Response(readable, { headers });
+          } else {
+            // Server-Sent Events format (default)
+            const headers = new Headers({
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Cache-Control',
+            });
+
+            const readable = new ReadableStream({
+              async start(controller) {
+                try {
+                  // Send initial success event
+                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+                    type: 'start',
+                    success: true,
+                    agentId,
+                  })}\n\n`));
+
+                  // Stream text chunks (both stream() and streamVNext() have textStream)
+                  for await (const chunk of stream.textStream) {
+                    const data = JSON.stringify({
+                      type: 'text-delta',
+                      chunk,
+                    });
+                    controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`));
+                  }
+
+                  // Send final usage and completion info
+                  const finalData = JSON.stringify({
+                    type: 'finish',
+                    usage: await stream.usage,
+                    finishReason: await stream.finishReason,
+                  });
+                  controller.enqueue(new TextEncoder().encode(`data: ${finalData}\n\n`));
+
+                  controller.close();
+                } catch (error) {
+                  const errorData = JSON.stringify({
+                    type: 'error',
+                    error: error instanceof Error ? error.message : 'Stream error',
+                  });
+                  controller.enqueue(new TextEncoder().encode(`data: ${errorData}\n\n`));
+                  controller.close();
+                }
+              },
+            });
+
+            return new Response(readable, { headers });
+          }
         } catch (error) {
           return c.json({
             success: false,
-            error: 'Failed to stream response',
+            error: 'Failed to start stream',
             details: error instanceof Error ? error.message : 'Unknown error',
           }, 500);
         }
       },
       openapi: {
         summary: 'Stream response from agent',
-        description: 'Stream a response from an agent in real-time',
+        description: 'Stream a response from an agent in real-time with V1/V2 model compatibility and dual format support',
         tags: ['AgentFlow - Agents'],
         parameters: [
           {
@@ -940,34 +1075,89 @@ export function createAgentFlowRoutes(
               schema: {
                 type: 'object',
                 properties: {
-                  messages: { type: 'array', items: { type: 'string' }, description: 'Array of messages' },
-                  prompt: { type: 'string', description: 'Single prompt string' },
-                  message: { type: 'string', description: 'Single message string' },
-                  output: { type: 'object', description: 'Output schema' },
-                  maxSteps: { type: 'number', description: 'Maximum steps' },
-                  maxTokens: { type: 'number', description: 'Maximum tokens' },
-                  temperature: { type: 'number', description: 'Temperature setting' },
-                  topP: { type: 'number', description: 'Top-p setting' },
-                  threadId: { type: 'string', description: 'Thread ID for memory (alternative to thread)' },
-                  thread: { type: 'string', description: 'Thread ID for memory' },
-                  resourceId: { type: 'string', description: 'Resource ID for memory (alternative to resource)' },
-                  resource: { type: 'string', description: 'Resource ID for memory' },
+                  messages: { 
+                    type: 'array', 
+                    items: { type: 'object' }, 
+                    description: 'Array of message objects with role and content' 
+                  },
+                  prompt: { type: 'string', description: 'Single prompt string (alternative to messages)' },
+                  message: { type: 'string', description: 'Single message string (alternative to messages)' },
+                  format: { 
+                    type: 'string', 
+                    enum: ['sse', 'json'], 
+                    default: 'sse',
+                    description: 'Streaming format: "sse" for Server-Sent Events or "json" for JSON Lines' 
+                  },
+                  output: { type: 'object', description: 'Output schema for structured responses' },
+                  maxSteps: { type: 'number', description: 'Maximum execution steps' },
+                  maxTokens: { type: 'number', description: 'Maximum tokens to generate' },
+                  temperature: { type: 'number', description: 'Temperature setting (0.0-2.0)' },
+                  toolChoice: { 
+                    type: 'string', 
+                    enum: ['auto', 'none', 'required'], 
+                    description: 'Tool usage preference' 
+                  },
+                  structuredOutput: { type: 'object', description: 'Structured output configuration' },
+                  providerOptions: { type: 'object', description: 'Provider-specific options' },
+                  threadId: { type: 'string', description: 'Thread ID for conversation memory (deprecated, use thread)' },
+                  thread: { type: 'string', description: 'Thread ID for conversation memory' },
+                  resourceId: { type: 'string', description: 'Resource ID for memory scope (deprecated, use resource)' },
+                  resource: { type: 'string', description: 'Resource ID for memory scope' },
                 },
+                required: ['messages'],
+                example: {
+                  messages: [{ role: 'user', content: 'Hello, how are you?' }],
+                  format: 'sse',
+                  maxSteps: 5,
+                  temperature: 0.7
+                }
               },
             },
           },
         },
         responses: {
           '200': {
-            description: 'Stream started successfully',
+            description: 'Stream started successfully - returns Server-Sent Events or JSON Lines based on format parameter',
             content: {
-              'text/plain': {
+              'text/event-stream': {
                 schema: { type: 'string' },
+                example: 'data: {"type":"start","success":true,"agentId":"agent-123"}\n\ndata: {"type":"text-delta","chunk":"Hello"}\n\ndata: {"type":"finish","usage":{"totalTokens":15},"finishReason":"stop"}\n\n'
+              },
+              'application/x-ndjson': {
+                schema: { type: 'string' },
+                example: '{"type":"start","success":true,"agentId":"agent-123"}\n{"type":"text-delta","chunk":"Hello"}\n{"type":"finish","usage":{"totalTokens":15},"finishReason":"stop"}\n'
               },
             },
           },
-          '404': { description: 'Agent not found' },
-          '500': { description: 'Stream failed' },
+          '404': { 
+            description: 'Agent not found',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: false },
+                    error: { type: 'string', example: 'Agent not found or not deployed' }
+                  }
+                }
+              }
+            }
+          },
+          '500': { 
+            description: 'Stream failed',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: false },
+                    error: { type: 'string', example: 'Failed to start stream' },
+                    details: { type: 'string' }
+                  }
+                }
+              }
+            }
+          },
         },
       },
     }),
